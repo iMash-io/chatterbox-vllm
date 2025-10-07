@@ -268,7 +268,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.tfmr = LlamaModel(vllm_config=vllm_config, prefix=prefix + ".tfmr")
 
         # Initialize custom components
-        self.t3conf = T3Config()
+        is_multilingual = getattr(self.cfg.hf_config, 'is_multilingual', False)
+
+        self.t3conf = T3Config.multilingual() if is_multilingual else T3Config()
         self.dim = self.t3conf.n_channels
         self.cond_enc = T3CondEnc(self.t3conf)
         self.text_emb = nn.Embedding(self.t3conf.text_tokens_dict_size, self.dim)
@@ -578,25 +580,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        # print("t3/compute_logits/hidden_states", hidden_states.shape, hidden_states.dtype)
-        # print("t3/compute_logits/sampling_metadata", sampling_metadata)
-
         # Split the hidden state vector into the three parts
         cond_hidden_states, uncond_hidden_states = hidden_states.split([self.dim, self.dim], dim=1)
-        # print("t3/compute_logits/normal_hidden_states", normal_hidden_states.shape, normal_hidden_states.dtype)
-        # print("t3/compute_logits/cfg_hidden_states", cfg_hidden_states.shape, cfg_hidden_states.dtype)
-
+    
         cond_logits = self.logits_processor(self.speech_head, cond_hidden_states, sampling_metadata)
         uncond_logits = self.logits_processor(self.speech_head, uncond_hidden_states, sampling_metadata)
-
+    
         logits = cond_logits + self.cfg_scale * (cond_logits - uncond_logits)
-
-        # print("t3/compute_logits/logit with the highest probability (cond, uncond, post-cfg):", cond_logits.argmax(), uncond_logits.argmax(), logits.argmax())
-
+    
         # HACK: Offset the logits so the resulting speech token is +SPEECH_TOKEN_OFFSET from the normal speech tokens.
-        #       We'll do this by adding SPEECH_TOKEN_OFFSET fake dimensions to the left of the logits.
-        #       This is a hack to help us unbatch batched inputs.
-        logits = torch.cat([torch.zeros(logits.shape[0], SPEECH_TOKEN_OFFSET).to(logits.device), logits], dim=1)
+        # Use -inf instead of zeros to ensure these padding tokens can never be selected
+        padding = torch.full((logits.shape[0], SPEECH_TOKEN_OFFSET), float('-inf'), 
+                             dtype=logits.dtype, device=logits.device)
+        logits = torch.cat([padding, logits], dim=1)
         return logits
 
 
