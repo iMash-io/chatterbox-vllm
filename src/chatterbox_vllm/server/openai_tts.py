@@ -57,9 +57,8 @@ class EngineConfig:
         "yes",
     }
     max_model_len: int = int(os.getenv("CHATTERBOX_MAX_MODEL_LEN", "1000"))
-    _gpu_mem_util = os.getenv("CHATTERBOX_GPU_MEMORY_UTILIZATION")
-    gpu_memory_utilization: Optional[float] = (
-        float(_gpu_mem_util) if _gpu_mem_util is not None else None
+    gpu_memory_utilization: float = float(
+        os.getenv("CHATTERBOX_GPU_MEMORY_UTILIZATION", "0.4")
     )
     max_batch_size: int = int(os.getenv("CHATTERBOX_MAX_BATCH_SIZE", "1"))
     diffusion_steps: int = int(os.getenv("CHATTERBOX_DIFFUSION_STEPS", "10"))
@@ -252,16 +251,12 @@ class TTSEngine:
     def _load_models(self) -> None:
         load_kwargs = dict(
             target_device=self.config.device,
+            gpu_memory_utilization=self.config.gpu_memory_utilization,
             max_model_len=self.config.max_model_len,
             max_batch_size=self.config.max_batch_size,
             enforce_eager=self.config.enforce_eager,
             compile=self.config.compile,
         )
-
-        if self.config.gpu_memory_utilization is not None:
-            load_kwargs["gpu_memory_utilization"] = (
-                self.config.gpu_memory_utilization
-            )
 
         if self.config.variant.lower() == "multilingual":
             tts = ChatterboxTTS.from_pretrained_multilingual(**load_kwargs)
