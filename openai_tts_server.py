@@ -330,13 +330,11 @@ async def _startup() -> None:
         if variant == "multilingual":
             _tts_engine = ChatterboxTTS.from_pretrained_multilingual(
                 target_device=device,
-                variant="multilingual",
                 s3gen_use_fp16=s3gen_use_fp16,
             )
         else:
             _tts_engine = ChatterboxTTS.from_pretrained(
                 target_device=device,
-                variant="english",
                 s3gen_use_fp16=s3gen_use_fp16,
             )
 
