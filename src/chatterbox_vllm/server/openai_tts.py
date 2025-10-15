@@ -8,8 +8,16 @@ import io
 import json
 import logging
 import os
+import pathlib
+import sys
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
+
+if __package__ in {None, ""}:
+    # Allow running this module as ``python openai_tts.py`` by ensuring the
+    # repository's ``src`` directory is importable before resolving package
+    # imports such as ``chatterbox_vllm``.
+    sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
 
 import torch
 import torchaudio.functional as AF
