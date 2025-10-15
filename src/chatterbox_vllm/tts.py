@@ -161,9 +161,12 @@ class ChatterboxTTS:
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
-        # Ensure the symlink in './t3-model/model.safetensors' points to t3_cfg_path
+        # Ensure the symlink in the repository's ``t3-model`` directory points to
+        # ``t3_cfg.safetensors`` regardless of the current working directory.
         t3_cfg_path = Path(local_path).parent / "t3_cfg.safetensors"
-        model_safetensors_path = Path.cwd() / "t3-model" / "model.safetensors"
+        model_dir = _resolve_repo_asset_dir("t3-model")
+        model_safetensors_path = model_dir / "model.safetensors"
+        model_safetensors_path.parent.mkdir(parents=True, exist_ok=True)
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
@@ -177,13 +180,42 @@ class ChatterboxTTS:
         for fpath in ["ve.safetensors", "t3_23lang.safetensors", "s3gen.safetensors", "mtl_tokenizer.json", "conds.pt", "Cangjie5_TC.json"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
-        # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
+        # Ensure the symlink in the repository's ``t3-model-multilingual`` directory
+        # points to ``t3_23lang.safetensors`` regardless of the working directory.
         t3_cfg_path = Path(local_path).parent / "t3_23lang.safetensors"
-        model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
+        model_dir = _resolve_repo_asset_dir("t3-model-multilingual")
+        model_safetensors_path = model_dir / "model.safetensors"
+        model_safetensors_path.parent.mkdir(parents=True, exist_ok=True)
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
         return cls.from_local(Path(local_path).parent, variant="multilingual", *args, **kwargs)
+
+
+def _resolve_repo_asset_dir(dirname: str) -> Path:
+    """Locate asset directories bundled with the project.
+
+    When the package is executed from arbitrary working directories (for example,
+    ``src/chatterbox_vllm/server`` when launching the OpenAI-compatible server as
+    ``python openai_tts.py``), relative paths anchored to ``Path.cwd()`` break.
+    Instead, resolve paths relative to the project root where assets such as
+    ``t3-model`` live.  If a matching directory cannot be located, fall back to
+    the current working directory to preserve the previous behaviour.
+    """
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / dirname,
+        Path(__file__).resolve().parents[1] / dirname,
+        Path.cwd() / dirname,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    # Default to the first candidate to keep the path stable even when the
+    # directory does not exist yet (it will be created by the caller).
+    return candidates[0]
     
     def get_supported_languages(self) -> dict[str, str]:
         """Return dictionary of supported language codes and names."""
