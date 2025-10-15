@@ -123,8 +123,11 @@ class ChatterboxTTS:
 
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
+        model_dirname = "t3-model" if variant == "english" else "t3-model-multilingual"
+        model_dir = _resolve_repo_asset_dir(model_dirname)
+
         base_vllm_kwargs = {
-            "model": "./t3-model" if variant == "english" else "./t3-model-multilingual",
+            "model": str(model_dir),
             "task": "generate",
             "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
             "tokenizer_mode": "custom",
