@@ -101,8 +101,6 @@ class SpeechRequest(BaseModel):
     first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
     chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
-    first_chunk_max_tokens: Optional[int] = Field(default=96, ge=16, le=512, description="Max speech tokens for the first chunk only")
-    first_chunk_max_seconds: Optional[float] = Field(default=None, description="Clamp first chunk duration in seconds (optional)")
 
 
 # ---------- Utilities ----------
@@ -229,7 +227,6 @@ def _synthesize_one(
     exaggeration: float,
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
-    max_tokens_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Synthesize one prompt to a waveform (1, T) tensor.
@@ -242,7 +239,7 @@ def _synthesize_one(
         temperature=temperature,
         exaggeration=exaggeration,
         diffusion_steps=diffusion_steps,
-        max_tokens=(max_tokens_override if max_tokens_override is not None else tts.max_model_len),
+        max_tokens=tts.max_model_len,
     )
     if not waves:
         raise RuntimeError("No audio generated")
@@ -263,8 +260,6 @@ async def _synthesize_streaming_pcm_frames(
     first_chunk_chars: int = 60,
     chunk_chars: int = 120,
     frame_ms: int = 20,
-    first_chunk_max_tokens: Optional[int] = None,
-    first_chunk_max_seconds: Optional[float] = None,
 ) -> Generator[bytes, None, None]:
     """
     Streaming generator:
@@ -301,8 +296,6 @@ async def _synthesize_streaming_pcm_frames(
     if not chunks:
         return
 
-    print(f"[STREAM] chunks={len(chunks)} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars}")
-
     for idx, chunk in enumerate(chunks):
         # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
         steps = diffusion_steps
@@ -318,23 +311,7 @@ async def _synthesize_streaming_pcm_frames(
             exaggeration=exaggeration,
             diffusion_steps=steps,
             audio_prompt_path=audio_prompt_path,
-            max_tokens_override=(first_chunk_max_tokens if (idx == 0 and first_chunk_max_tokens is not None) else None),
         )
-
-        # Debug: report generated chunk length
-        try:
-            wav_len = wav.shape[1]
-            secs = wav_len / sr
-            print(f"[STREAM] chunk={idx} steps={steps} max_tokens_override={(first_chunk_max_tokens if (idx==0 and first_chunk_max_tokens is not None) else None)} raw_len_samples={wav_len} raw_len_sec={secs:.2f}")
-        except Exception:
-            pass
-
-        # Optional clamp for first chunk duration (safety while tuning)
-        if idx == 0 and first_chunk_max_seconds and first_chunk_max_seconds > 0:
-            max_samples = int(sr * first_chunk_max_seconds)
-            if wav.shape[1] > max_samples:
-                print(f"[STREAM] chunk=0 clamp_seconds applied: {first_chunk_max_seconds}s (before={wav.shape[1]/sr:.2f}s)")
-                wav = wav[:, :max_samples]
 
         # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
         fade_ms = 5
@@ -402,29 +379,12 @@ async def _startup() -> None:
     try:
         # Precompute audio conditionals (default) and do a small diffusion (fast)
         _ = _tts_engine.get_audio_conditionals(None)
-        warm_steps = int(os.environ.get("CHATTERBOX_WARMUP_DIFF_STEPS", "2"))
-        lang = "en" if variant != "multilingual" else "en"
-        # Base warmup
         _ = _tts_engine.generate(
             prompts=warm_text,
-            language_id=lang,
-            diffusion_steps=warm_steps,
+            language_id="en" if variant != "multilingual" else "en",
+            diffusion_steps=int(os.environ.get("CHATTERBOX_WARMUP_DIFF_STEPS", "2")),
             max_tokens=min(32, _tts_engine.max_model_len),
         )
-        # Multi-shape warmup to improve cudagraph hit rate for first-batch shapes
-        for wtxt, mtok in [
-            ("hello warmup", 64),
-            ("this is a medium length warmup prompt for graph capture", 128),
-        ]:
-            try:
-                _ = _tts_engine.generate(
-                    prompts=wtxt,
-                    language_id=lang,
-                    diffusion_steps=warm_steps,
-                    max_tokens=min(mtok, _tts_engine.max_model_len),
-                )
-            except Exception:
-                pass
     except Exception as e:
         # Proceed anyway; the first request may pay the warmup cost if this fails.
         print(f"[WARN] Warmup failed: {e}")
@@ -461,9 +421,8 @@ async def create_speech(req: SpeechRequest):
     if req.stream:
         stream_headers = {
             "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache, no-transform",
+            "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
@@ -479,8 +438,6 @@ async def create_speech(req: SpeechRequest):
                 first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
-                first_chunk_max_tokens=req.first_chunk_max_tokens,
-                first_chunk_max_seconds=req.first_chunk_max_seconds,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,

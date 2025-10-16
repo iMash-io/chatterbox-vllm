@@ -117,8 +117,6 @@ def main():
     p.add_argument("--first-chunk-chars", dest="first_chunk_chars", type=int, default=60, help='Body field "first_chunk_chars"')
     p.add_argument("--chunk-chars", dest="chunk_chars", type=int, default=120, help='Body field "chunk_chars"')
     p.add_argument("--frame-ms", dest="frame_ms", type=int, default=20, help='Body field "frame_ms" (PCM frame size)')
-    p.add_argument("--first-chunk-max-tokens", dest="first_chunk_max_tokens", type=int, default=96, help='Body field "first_chunk_max_tokens"')
-    p.add_argument("--first-chunk-max-seconds", dest="first_chunk_max_seconds", type=float, default=None, help='Body field "first_chunk_max_seconds" (optional)')
 
     p.add_argument(
         "--outfile",
@@ -157,8 +155,6 @@ def main():
         "first_chunk_chars": args.first_chunk_chars,
         "chunk_chars": args.chunk_chars,
         "frame_ms": args.frame_ms,
-        "first_chunk_max_tokens": args.first_chunk_max_tokens,
-        "first_chunk_max_seconds": args.first_chunk_max_seconds,
     }
 
     headers = {"Content-Type": "application/json"}
