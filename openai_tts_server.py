@@ -277,6 +277,8 @@ async def _synthesize_streaming_pcm_frames(
         if n_samples > 0:
             primer = torch.zeros(1, n_samples, dtype=torch.float32, device="cpu")
             yield _float32_to_pcm16_bytes(primer)
+            # Hint the event loop to flush headers and first bytes immediately
+            await asyncio.sleep(0)
 
     # Build chunks: small first chunk, larger subsequent chunks
     chunks: List[str] = []
@@ -316,8 +318,9 @@ async def _synthesize_streaming_pcm_frames(
         fade_samples = int(sr * fade_ms / 1000)
         if wav.numel() > fade_samples and fade_samples > 0:
             tail = wav[:, -fade_samples:]
-            ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype)
-            wav[:, -fade_samples:] = tail * ramp
+            ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
+            tail_faded = tail * ramp
+            wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
 
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
