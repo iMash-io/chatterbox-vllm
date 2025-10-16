@@ -102,6 +102,8 @@ class SpeechRequest(BaseModel):
     first_chunk_chars: Optional[int] = Field(default=32, ge=10, le=200, description="Max chars for the first chunk")
     chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
+    max_tokens_first_chunk: Optional[int] = Field(default=None, ge=16, le=512, description="Max tokens for T3 on first chunk only")
+    crossfade_ms: Optional[int] = Field(default=10, ge=0, le=50, description="Crossfade between chunk boundaries (ms) to reduce clicks")
 
 
 # ---------- Utilities ----------
@@ -228,6 +230,7 @@ def _synthesize_one(
     exaggeration: float,
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
+    max_tokens_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Synthesize one prompt to a waveform (1, T) tensor.
@@ -240,7 +243,7 @@ def _synthesize_one(
         temperature=temperature,
         exaggeration=exaggeration,
         diffusion_steps=diffusion_steps,
-        max_tokens=tts.max_model_len,
+        max_tokens=min(max_tokens_override, tts.max_model_len) if max_tokens_override is not None else tts.max_model_len,
     )
     if not waves:
         raise RuntimeError("No audio generated")
@@ -260,11 +263,13 @@ async def _synthesize_streaming_pcm_frames(
     t0: float,
     client_epoch_ms: Optional[int] = None,
     server_epoch_ms: Optional[int] = None,
+    max_tokens_first_chunk: Optional[int] = None,
     primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
     first_chunk_chars: int = 60,
     chunk_chars: int = 120,
     frame_ms: int = 20,
+    crossfade_ms: int = 10,
 ) -> Generator[bytes, None, None]:
     """
     Streaming generator:
@@ -280,6 +285,7 @@ async def _synthesize_streaming_pcm_frames(
     total_bytes = 0
     total_frames = 0
     first_synth_frame_sent = False
+    prev_tail: Optional[torch.Tensor] = None
     skew_ms = (server_epoch_ms - client_epoch_ms) if (client_epoch_ms is not None and server_epoch_ms is not None) else None
     print(f"[TTS_STREAM_START] req_id={req_id} variant={getattr(tts, 'variant', 'unknown')} sr={sr} primer_ms={primer_silence_ms} first_chunk_diff_steps={first_chunk_diff_steps} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars} frame_ms={frame_ms} client_epoch_ms={client_epoch_ms} server_epoch_ms={server_epoch_ms} skew_ms={skew_ms}")
 
@@ -328,6 +334,7 @@ async def _synthesize_streaming_pcm_frames(
             exaggeration=exaggeration,
             diffusion_steps=steps,
             audio_prompt_path=audio_prompt_path,
+            max_tokens_override=(max_tokens_first_chunk if idx == 0 else None),
         )
         chunk_ms = int((time.perf_counter() - chunk_start) * 1000)
         audio_samples = int(wav.shape[-1]) if torch.is_tensor(wav) else 0
@@ -342,6 +349,30 @@ async def _synthesize_streaming_pcm_frames(
             ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
             tail_faded = tail * ramp
             wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
+
+        # Crossfade with previous tail to avoid boundary clicks between chunks
+        applied_cross = 0
+        cross_samples = int(sr * max(0, crossfade_ms) / 1000)
+        if idx > 0 and cross_samples > 0 and prev_tail is not None and prev_tail.numel() > 0:
+            head_len = min(wav.shape[-1], cross_samples)
+            tail_len = min(prev_tail.shape[-1], cross_samples)
+            mix_len = min(head_len, tail_len)
+            if mix_len > 0:
+                head = wav[:, :mix_len]
+                ramp_up = torch.linspace(0.0, 1.0, steps=mix_len, device=head.device, dtype=head.dtype).unsqueeze(0)
+                ramp_dn = torch.linspace(1.0, 0.0, steps=mix_len, device=prev_tail.device, dtype=head.dtype).unsqueeze(0)
+                wav[:, :mix_len] = head * ramp_up + prev_tail[:, -mix_len:] * ramp_dn
+                applied_cross = mix_len
+
+        # Update prev_tail for next crossfade
+        if cross_samples > 0:
+            keep = min(cross_samples, wav.shape[-1])
+            prev_tail = wav[:, -keep:].detach().clone()
+        else:
+            prev_tail = None
+
+        if applied_cross:
+            print(f"[TTS_CROSSFADE] req_id={req_id} idx={idx} samples={applied_cross}")
 
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
@@ -481,11 +512,13 @@ async def create_speech(req: SpeechRequest, request: Request):
                 t0=time.perf_counter(),
                 client_epoch_ms=client_epoch_ms,
                 server_epoch_ms=server_epoch_ms,
+                max_tokens_first_chunk=req.max_tokens_first_chunk,
                 primer_silence_ms=req.primer_silence_ms or 0,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 2),
                 first_chunk_chars=req.first_chunk_chars or 32,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
+                crossfade_ms=req.crossfade_ms or 10,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,

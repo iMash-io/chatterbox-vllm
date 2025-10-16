@@ -118,6 +118,8 @@ def main():
     p.add_argument("--first-chunk-chars", dest="first_chunk_chars", type=int, default=60, help='Body field "first_chunk_chars"')
     p.add_argument("--chunk-chars", dest="chunk_chars", type=int, default=120, help='Body field "chunk_chars"')
     p.add_argument("--frame-ms", dest="frame_ms", type=int, default=20, help='Body field "frame_ms" (PCM frame size)')
+    p.add_argument("--max-tokens-first-chunk", dest="max_tokens_first_chunk", type=int, default=None, help="Body field 'max_tokens_first_chunk' (caps T3 tokens for first chunk)")
+    p.add_argument("--crossfade-ms", dest="crossfade_ms", type=int, default=10, help="Body field 'crossfade_ms' (ms crossfade between chunks)")
 
     p.add_argument(
         "--outfile",
@@ -156,6 +158,8 @@ def main():
         "first_chunk_chars": args.first_chunk_chars,
         "chunk_chars": args.chunk_chars,
         "frame_ms": args.frame_ms,
+        "max_tokens_first_chunk": args.max_tokens_first_chunk,
+        "crossfade_ms": args.crossfade_ms,
     }
 
     client_req_id = uuid.uuid4().hex
