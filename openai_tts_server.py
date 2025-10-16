@@ -96,6 +96,11 @@ class SpeechRequest(BaseModel):
     diffusion_steps: Optional[int] = Field(default=10)
     audio_prompt_path: Optional[str] = Field(default=None, description="Reference audio path for timbre/voice embedding")
     watermark: Optional[str] = Field(default="off", pattern="^(on|off)$", description="If 'off', no watermarking step is applied")
+    primer_silence_ms: Optional[int] = Field(default=0, ge=0, le=200, description="If >0, yield this ms of silence immediately to flush headers")
+    first_chunk_diff_steps: Optional[int] = Field(default=3, ge=1, description="Diffusion steps for the first chunk only")
+    first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
+    chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
+    frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
 
 
 # ---------- Utilities ----------
@@ -250,9 +255,11 @@ async def _synthesize_streaming_pcm_frames(
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
     watermark: str,
+    primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
+    first_chunk_chars: int = 60,
     chunk_chars: int = 120,
-    frame_ms: int = 40,
+    frame_ms: int = 20,
 ) -> Generator[bytes, None, None]:
     """
     Streaming generator:
@@ -263,7 +270,27 @@ async def _synthesize_streaming_pcm_frames(
     """
     tts = _ensure_engine()
     sr = tts.sr
-    chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
+
+    # Optional primer silence to flush headers immediately and force chunked streaming
+    if primer_silence_ms and primer_silence_ms > 0:
+        n_samples = int(sr * primer_silence_ms / 1000)
+        if n_samples > 0:
+            primer = torch.zeros(1, n_samples, dtype=torch.float32, device="cpu")
+            yield _float32_to_pcm16_bytes(primer)
+
+    # Build chunks: small first chunk, larger subsequent chunks
+    chunks: List[str] = []
+    if first_chunk_chars and first_chunk_chars > 0:
+        fchunks = _split_text_for_low_latency(text, max_chars=first_chunk_chars)
+        if fchunks:
+            first_text = fchunks[0]
+            chunks.append(first_text)
+            remaining = text[len(first_text):].strip()
+            if remaining:
+                chunks.extend(_split_text_for_low_latency(remaining, max_chars=chunk_chars))
+    else:
+        chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
+
     if not chunks:
         return
 
@@ -383,10 +410,13 @@ async def create_speech(req: SpeechRequest):
     if fmt == "pcm":
         fmt = "pcm16"
 
-    # Validate format vs streaming
-    if req.stream and fmt == "wav":
-        # WAV needs header with known length; streaming wav complicates headers.
-        # Use PCM16 streaming for ultra-low-latency live playback.
+    # Streaming path: regardless of requested format, stream linear PCM for lowest latency
+    if req.stream:
+        stream_headers = {
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
                 req.input,
@@ -396,11 +426,14 @@ async def create_speech(req: SpeechRequest):
                 diffusion_steps=req.diffusion_steps or 10,
                 audio_prompt_path=req.audio_prompt_path,
                 watermark=req.watermark or "off",
-                first_chunk_diff_steps=5,  # accelerate TTFA for first chunk while keeping later quality
-                chunk_chars=120,
-                frame_ms=40,
+                primer_silence_ms=req.primer_silence_ms or 0,
+                first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
+                first_chunk_chars=req.first_chunk_chars or 60,
+                chunk_chars=req.chunk_chars or 120,
+                frame_ms=req.frame_ms or 20,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
+            headers=stream_headers,
         )
 
     # Non-streaming path: synthesize full audio then return as a single response
