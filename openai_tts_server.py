@@ -59,7 +59,6 @@ import sys
 import io
 import math
 import asyncio
-import time, uuid
 from typing import Optional, Iterable, Generator, List, Tuple
 
 # Ensure `src/` is importable when running from repo root
@@ -68,7 +67,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "src"))
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
@@ -98,12 +97,10 @@ class SpeechRequest(BaseModel):
     audio_prompt_path: Optional[str] = Field(default=None, description="Reference audio path for timbre/voice embedding")
     watermark: Optional[str] = Field(default="off", pattern="^(on|off)$", description="If 'off', no watermarking step is applied")
     primer_silence_ms: Optional[int] = Field(default=0, ge=0, le=200, description="If >0, yield this ms of silence immediately to flush headers")
-    first_chunk_diff_steps: Optional[int] = Field(default=2, ge=1, description="Diffusion steps for the first chunk only")
-    first_chunk_chars: Optional[int] = Field(default=32, ge=10, le=200, description="Max chars for the first chunk")
+    first_chunk_diff_steps: Optional[int] = Field(default=3, ge=1, description="Diffusion steps for the first chunk only")
+    first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
     chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
-    max_tokens_first_chunk: Optional[int] = Field(default=None, ge=16, le=512, description="Max tokens for T3 on first chunk only")
-    crossfade_ms: Optional[int] = Field(default=10, ge=0, le=50, description="Crossfade between chunk boundaries (ms) to reduce clicks")
 
 
 # ---------- Utilities ----------
@@ -230,7 +227,6 @@ def _synthesize_one(
     exaggeration: float,
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
-    max_tokens_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Synthesize one prompt to a waveform (1, T) tensor.
@@ -243,7 +239,7 @@ def _synthesize_one(
         temperature=temperature,
         exaggeration=exaggeration,
         diffusion_steps=diffusion_steps,
-        max_tokens=min(max_tokens_override, tts.max_model_len) if max_tokens_override is not None else tts.max_model_len,
+        max_tokens=tts.max_model_len,
     )
     if not waves:
         raise RuntimeError("No audio generated")
@@ -259,17 +255,11 @@ async def _synthesize_streaming_pcm_frames(
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
     watermark: str,
-    req_id: str,
-    t0: float,
-    client_epoch_ms: Optional[int] = None,
-    server_epoch_ms: Optional[int] = None,
-    max_tokens_first_chunk: Optional[int] = None,
     primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
     first_chunk_chars: int = 60,
     chunk_chars: int = 120,
     frame_ms: int = 20,
-    crossfade_ms: int = 10,
 ) -> Generator[bytes, None, None]:
     """
     Streaming generator:
@@ -281,24 +271,13 @@ async def _synthesize_streaming_pcm_frames(
     tts = _ensure_engine()
     sr = tts.sr
 
-    start = t0
-    total_bytes = 0
-    total_frames = 0
-    first_synth_frame_sent = False
-    prev_tail: Optional[torch.Tensor] = None
-    skew_ms = (server_epoch_ms - client_epoch_ms) if (client_epoch_ms is not None and server_epoch_ms is not None) else None
-    print(f"[TTS_STREAM_START] req_id={req_id} variant={getattr(tts, 'variant', 'unknown')} sr={sr} primer_ms={primer_silence_ms} first_chunk_diff_steps={first_chunk_diff_steps} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars} frame_ms={frame_ms} client_epoch_ms={client_epoch_ms} server_epoch_ms={server_epoch_ms} skew_ms={skew_ms}")
-
     # Optional primer silence to flush headers immediately and force chunked streaming
     if primer_silence_ms and primer_silence_ms > 0:
         n_samples = int(sr * primer_silence_ms / 1000)
         if n_samples > 0:
             primer = torch.zeros(1, n_samples, dtype=torch.float32, device="cpu")
-            b = _float32_to_pcm16_bytes(primer)
-            total_bytes += len(b); total_frames += 1
-            yield b
+            yield _float32_to_pcm16_bytes(primer)
             # Hint the event loop to flush headers and first bytes immediately
-            print(f"[TTS_PRIMER_SENT] req_id={req_id} t_ms={int((time.perf_counter()-start)*1000)}")
             await asyncio.sleep(0)
 
     # Build chunks: small first chunk, larger subsequent chunks
@@ -318,14 +297,12 @@ async def _synthesize_streaming_pcm_frames(
         return
 
     for idx, chunk in enumerate(chunks):
-        print(f"[TTS_CHUNK_START] req_id={req_id} idx={idx} text_len={len(chunk)} t_ms={int((time.perf_counter()-start)*1000)}")
         # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
         steps = diffusion_steps
         if idx == 0 and first_chunk_diff_steps is not None:
             steps = max(1, int(first_chunk_diff_steps))
 
         # Heavy compute dispatched to thread to not block event loop
-        chunk_start = time.perf_counter()
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
             chunk,
@@ -334,12 +311,7 @@ async def _synthesize_streaming_pcm_frames(
             exaggeration=exaggeration,
             diffusion_steps=steps,
             audio_prompt_path=audio_prompt_path,
-            max_tokens_override=(max_tokens_first_chunk if idx == 0 else None),
         )
-        chunk_ms = int((time.perf_counter() - chunk_start) * 1000)
-        audio_samples = int(wav.shape[-1]) if torch.is_tensor(wav) else 0
-        audio_ms = int(audio_samples * 1000 / sr) if sr else 0
-        print(f"[TTS_CHUNK_DONE] req_id={req_id} idx={idx} chunk_ms={chunk_ms} steps={steps} audio_ms={audio_ms} samples={audio_samples} t_ms={int((time.perf_counter()-start)*1000)}")
 
         # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
         fade_ms = 5
@@ -350,30 +322,6 @@ async def _synthesize_streaming_pcm_frames(
             tail_faded = tail * ramp
             wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
 
-        # Crossfade with previous tail to avoid boundary clicks between chunks
-        applied_cross = 0
-        cross_samples = int(sr * max(0, crossfade_ms) / 1000)
-        if idx > 0 and cross_samples > 0 and prev_tail is not None and prev_tail.numel() > 0:
-            head_len = min(wav.shape[-1], cross_samples)
-            tail_len = min(prev_tail.shape[-1], cross_samples)
-            mix_len = min(head_len, tail_len)
-            if mix_len > 0:
-                head = wav[:, :mix_len]
-                ramp_up = torch.linspace(0.0, 1.0, steps=mix_len, device=head.device, dtype=head.dtype).unsqueeze(0)
-                ramp_dn = torch.linspace(1.0, 0.0, steps=mix_len, device=prev_tail.device, dtype=head.dtype).unsqueeze(0)
-                wav[:, :mix_len] = head * ramp_up + prev_tail[:, -mix_len:] * ramp_dn
-                applied_cross = mix_len
-
-        # Update prev_tail for next crossfade
-        if cross_samples > 0:
-            keep = min(cross_samples, wav.shape[-1])
-            prev_tail = wav[:, -keep:].detach().clone()
-        else:
-            prev_tail = None
-
-        if applied_cross:
-            print(f"[TTS_CROSSFADE] req_id={req_id} idx={idx} samples={applied_cross}")
-
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
 
@@ -382,14 +330,7 @@ async def _synthesize_streaming_pcm_frames(
         for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
             if not frame:
                 continue
-            if not first_synth_frame_sent:
-                print(f"[TTS_FIRST_AUDIO_SENT] req_id={req_id} t_ms={int((time.perf_counter()-start)*1000)}")
-                first_synth_frame_sent = True
-            total_bytes += len(frame); total_frames += 1
             yield frame
-
-        if idx == len(chunks) - 1:
-            print(f"[TTS_STREAM_END] req_id={req_id} total_ms={int((time.perf_counter()-start)*1000)} total_bytes={total_bytes} total_frames={total_frames} chunks={len(chunks)}")
 
 
 # ---------- FastAPI lifecycle ----------
@@ -406,7 +347,6 @@ async def _startup() -> None:
     variant = os.environ.get("CHATTERBOX_VARIANT", "english").strip().lower()
     s3gen_use_fp16 = os.environ.get("CHATTERBOX_S3GEN_FP16", "0").strip() in ("1", "true", "True")
     local_ckpt = os.environ.get("CHATTERBOX_USE_LOCAL_CKPT", "").strip() or None
-    compile_flag = os.environ.get("CHATTERBOX_COMPILE", "0").strip() in ("1", "true", "True")
 
     # Load engine (avoid modifying repo code by using exported constructors)
     if local_ckpt:
@@ -415,20 +355,17 @@ async def _startup() -> None:
             target_device=device,
             variant=("english" if variant != "multilingual" else "multilingual"),
             s3gen_use_fp16=s3gen_use_fp16,
-            compile=compile_flag,
         )
     else:
         if variant == "multilingual":
             _tts_engine = ChatterboxTTS.from_pretrained_multilingual(
                 target_device=device,
                 s3gen_use_fp16=s3gen_use_fp16,
-                compile=compile_flag,
             )
         else:
             _tts_engine = ChatterboxTTS.from_pretrained(
                 target_device=device,
                 s3gen_use_fp16=s3gen_use_fp16,
-                compile=compile_flag,
             )
 
     _tts_sr = _tts_engine.sr
@@ -465,24 +402,11 @@ async def _shutdown() -> None:
 # ---------- API Routes ----------
 
 @APP.post("/v1/audio/speech")
-async def create_speech(req: SpeechRequest, request: Request):
+async def create_speech(req: SpeechRequest):
     """
     OpenAI-compatible TTS endpoint. Supports streaming and non-streaming.
     """
     tts = _ensure_engine()
-    req_id = uuid.uuid4().hex
-
-    # Correlation headers from client
-    try:
-        client_req_id = request.headers.get("x-client-request-id")
-    except Exception:
-        client_req_id = None
-    try:
-        _cse = request.headers.get("x-client-start-epoch-ms")
-        client_epoch_ms = int(_cse) if _cse else None
-    except Exception:
-        client_epoch_ms = None
-    server_epoch_ms = int(time.time() * 1000)
 
     # Normalize/resolve response format
     fmt = (req.response_format or req.format or "wav")
@@ -495,9 +419,6 @@ async def create_speech(req: SpeechRequest, request: Request):
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "X-Req-Id": req_id,
-            "X-Client-Request-Id": client_req_id or "",
-            "X-Server-Start-Epoch-Ms": str(server_epoch_ms),
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
@@ -508,28 +429,17 @@ async def create_speech(req: SpeechRequest, request: Request):
                 diffusion_steps=req.diffusion_steps or 10,
                 audio_prompt_path=req.audio_prompt_path,
                 watermark=req.watermark or "off",
-                req_id=req_id,
-                t0=time.perf_counter(),
-                client_epoch_ms=client_epoch_ms,
-                server_epoch_ms=server_epoch_ms,
-                max_tokens_first_chunk=req.max_tokens_first_chunk,
                 primer_silence_ms=req.primer_silence_ms or 0,
-                first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 2),
-                first_chunk_chars=req.first_chunk_chars or 32,
+                first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
+                first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
-                crossfade_ms=req.crossfade_ms or 10,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,
         )
 
     # Non-streaming path: synthesize full audio then return as a single response
-    non_stream_headers = {
-        "X-Req-Id": req_id,
-        "X-Client-Request-Id": client_req_id or "",
-        "X-Server-Start-Epoch-Ms": str(server_epoch_ms),
-    }
     try:
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
@@ -544,10 +454,10 @@ async def create_speech(req: SpeechRequest, request: Request):
 
         if fmt == "pcm16":
             pcm = _float32_to_pcm16_bytes(wav)
-            return Response(content=pcm, media_type=f"audio/pcm;rate={tts.sr};channels=1", headers=non_stream_headers)
+            return Response(content=pcm, media_type=f"audio/pcm;rate={tts.sr};channels=1")
         else:
             data = _pack_wav_bytes(wav, sr=tts.sr)
-            return Response(content=data, media_type="audio/wav", headers=non_stream_headers)
+            return Response(content=data, media_type="audio/wav")
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:

@@ -26,7 +26,6 @@ import wave
 from typing import Tuple, Optional
 
 import requests
-import uuid
 
 
 def human_bytes(n: int) -> str:
@@ -118,8 +117,6 @@ def main():
     p.add_argument("--first-chunk-chars", dest="first_chunk_chars", type=int, default=60, help='Body field "first_chunk_chars"')
     p.add_argument("--chunk-chars", dest="chunk_chars", type=int, default=120, help='Body field "chunk_chars"')
     p.add_argument("--frame-ms", dest="frame_ms", type=int, default=20, help='Body field "frame_ms" (PCM frame size)')
-    p.add_argument("--max-tokens-first-chunk", dest="max_tokens_first_chunk", type=int, default=None, help="Body field 'max_tokens_first_chunk' (caps T3 tokens for first chunk)")
-    p.add_argument("--crossfade-ms", dest="crossfade_ms", type=int, default=10, help="Body field 'crossfade_ms' (ms crossfade between chunks)")
 
     p.add_argument(
         "--outfile",
@@ -158,17 +155,9 @@ def main():
         "first_chunk_chars": args.first_chunk_chars,
         "chunk_chars": args.chunk_chars,
         "frame_ms": args.frame_ms,
-        "max_tokens_first_chunk": args.max_tokens_first_chunk,
-        "crossfade_ms": args.crossfade_ms,
     }
 
-    client_req_id = uuid.uuid4().hex
-    client_epoch_ms = int(time.time() * 1000)
-    headers = {
-        "Content-Type": "application/json",
-        "X-Client-Request-Id": client_req_id,
-        "X-Client-Start-Epoch-Ms": str(client_epoch_ms),
-    }
+    headers = {"Content-Type": "application/json"}
 
     # Optional ffplay
     ffplay_proc = None
@@ -239,16 +228,6 @@ def main():
                 print("✅ Transfer-Encoding: chunked (streaming)")
             elif not cl:
                 print("ℹ️  No Content-Length seen; proxy may still buffer the first chunk before forwarding.")
-            # Correlate with server timing headers for cross-reference
-            srv_req_id = resp.headers.get("x-req-id", "")
-            srv_start_ms = resp.headers.get("x-server-start-epoch-ms", "")
-            try:
-                srv_start_ms_int = int(srv_start_ms)
-            except Exception:
-                srv_start_ms_int = None
-            approx_skew = (srv_start_ms_int - client_epoch_ms) if srv_start_ms_int is not None else None
-            print(f"↔️  Correlate IDs: client_req_id={client_req_id} server_req_id={srv_req_id}")
-            print(f"🕒 Epochs: client_start_ms={client_epoch_ms} server_start_ms={srv_start_ms} approx_skew_ms={approx_skew}")
 
             # If server returned PCM but you asked for WAV/MP3 (or vice versa), we still just stream bytes;
             # playback/wrap uses the parsed content-type for correctness.
@@ -274,15 +253,6 @@ def main():
                             f"⏱️  Time to headers (connect+TLS+server accept): {(t_headers - t0) * 1000:.2f} ms"
                         )
                         print(f"⏱️  TTFA (request->first bytes): {(t_first - t0) * 1000:.2f} ms")
-                        # Compute approximate server-view TTFA using epochs if available
-                        try:
-                            client_first_epoch_ms = int(client_epoch_ms + (t_first - t0) * 1000)
-                            if 'srv_start_ms_int' in locals() and srv_start_ms_int is not None:
-                                approx_ttfa_server_ms = client_first_epoch_ms - srv_start_ms_int
-                                print(f"⏱️  Approx server-view TTFA (epochs): {approx_ttfa_server_ms} ms")
-                                print(f"↔️  Epochs: client_first_epoch_ms={client_first_epoch_ms} server_start_epoch_ms={srv_start_ms_int} skew_ms~={(srv_start_ms_int - client_epoch_ms) if srv_start_ms_int is not None else 'n/a'}")
-                        except Exception:
-                            pass
 
                     total_bytes += len(chunk)
                     chunks += 1
@@ -347,5 +317,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
