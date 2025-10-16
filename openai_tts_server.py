@@ -347,6 +347,7 @@ async def _startup() -> None:
     variant = os.environ.get("CHATTERBOX_VARIANT", "english").strip().lower()
     s3gen_use_fp16 = os.environ.get("CHATTERBOX_S3GEN_FP16", "0").strip() in ("1", "true", "True")
     local_ckpt = os.environ.get("CHATTERBOX_USE_LOCAL_CKPT", "").strip() or None
+    enable_compile = os.environ.get("CHATTERBOX_COMPILE", "0").strip().lower() in ("1","true","yes","on")
 
     # Load engine (avoid modifying repo code by using exported constructors)
     if local_ckpt:
@@ -355,17 +356,20 @@ async def _startup() -> None:
             target_device=device,
             variant=("english" if variant != "multilingual" else "multilingual"),
             s3gen_use_fp16=s3gen_use_fp16,
+            compile=enable_compile,
         )
     else:
         if variant == "multilingual":
             _tts_engine = ChatterboxTTS.from_pretrained_multilingual(
                 target_device=device,
                 s3gen_use_fp16=s3gen_use_fp16,
+                compile=enable_compile,
             )
         else:
             _tts_engine = ChatterboxTTS.from_pretrained(
                 target_device=device,
                 s3gen_use_fp16=s3gen_use_fp16,
+                compile=enable_compile,
             )
 
     _tts_sr = _tts_engine.sr
@@ -385,7 +389,7 @@ async def _startup() -> None:
         # Proceed anyway; the first request may pay the warmup cost if this fails.
         print(f"[WARN] Warmup failed: {e}")
 
-    print(f"[INIT] TTS engine ready on device={device}, variant={variant}, sr={_tts_sr}")
+    print(f"[INIT] TTS engine ready on device={device}, variant={variant}, sr={_tts_sr}, compile={enable_compile}")
 
 
 @APP.on_event("shutdown")
