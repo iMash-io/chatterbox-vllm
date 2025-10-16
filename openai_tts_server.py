@@ -301,6 +301,8 @@ async def _synthesize_streaming_pcm_frames(
     if not chunks:
         return
 
+    print(f"[STREAM] chunks={len(chunks)} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars}")
+
     for idx, chunk in enumerate(chunks):
         # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
         steps = diffusion_steps
@@ -319,10 +321,19 @@ async def _synthesize_streaming_pcm_frames(
             max_tokens_override=(first_chunk_max_tokens if (idx == 0 and first_chunk_max_tokens is not None) else None),
         )
 
+        # Debug: report generated chunk length
+        try:
+            wav_len = wav.shape[1]
+            secs = wav_len / sr
+            print(f"[STREAM] chunk={idx} steps={steps} max_tokens_override={(first_chunk_max_tokens if (idx==0 and first_chunk_max_tokens is not None) else None)} raw_len_samples={wav_len} raw_len_sec={secs:.2f}")
+        except Exception:
+            pass
+
         # Optional clamp for first chunk duration (safety while tuning)
         if idx == 0 and first_chunk_max_seconds and first_chunk_max_seconds > 0:
             max_samples = int(sr * first_chunk_max_seconds)
             if wav.shape[1] > max_samples:
+                print(f"[STREAM] chunk=0 clamp_seconds applied: {first_chunk_max_seconds}s (before={wav.shape[1]/sr:.2f}s)")
                 wav = wav[:, :max_samples]
 
         # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
@@ -450,8 +461,9 @@ async def create_speech(req: SpeechRequest):
     if req.stream:
         stream_headers = {
             "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
