@@ -68,7 +68,7 @@ sys.path.append(str(Path(__file__).resolve().parent / "src"))
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
@@ -258,6 +258,8 @@ async def _synthesize_streaming_pcm_frames(
     watermark: str,
     req_id: str,
     t0: float,
+    client_epoch_ms: Optional[int] = None,
+    server_epoch_ms: Optional[int] = None,
     primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
     first_chunk_chars: int = 60,
@@ -278,7 +280,8 @@ async def _synthesize_streaming_pcm_frames(
     total_bytes = 0
     total_frames = 0
     first_synth_frame_sent = False
-    print(f"[TTS_STREAM_START] req_id={req_id} variant={getattr(tts, 'variant', 'unknown')} sr={sr} primer_ms={primer_silence_ms} first_chunk_diff_steps={first_chunk_diff_steps} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars} frame_ms={frame_ms}")
+    skew_ms = (server_epoch_ms - client_epoch_ms) if (client_epoch_ms is not None and server_epoch_ms is not None) else None
+    print(f"[TTS_STREAM_START] req_id={req_id} variant={getattr(tts, 'variant', 'unknown')} sr={sr} primer_ms={primer_silence_ms} first_chunk_diff_steps={first_chunk_diff_steps} first_chunk_chars={first_chunk_chars} chunk_chars={chunk_chars} frame_ms={frame_ms} client_epoch_ms={client_epoch_ms} server_epoch_ms={server_epoch_ms} skew_ms={skew_ms}")
 
     # Optional primer silence to flush headers immediately and force chunked streaming
     if primer_silence_ms and primer_silence_ms > 0:
@@ -431,12 +434,24 @@ async def _shutdown() -> None:
 # ---------- API Routes ----------
 
 @APP.post("/v1/audio/speech")
-async def create_speech(req: SpeechRequest):
+async def create_speech(req: SpeechRequest, request: Request):
     """
     OpenAI-compatible TTS endpoint. Supports streaming and non-streaming.
     """
     tts = _ensure_engine()
     req_id = uuid.uuid4().hex
+
+    # Correlation headers from client
+    try:
+        client_req_id = request.headers.get("x-client-request-id")
+    except Exception:
+        client_req_id = None
+    try:
+        _cse = request.headers.get("x-client-start-epoch-ms")
+        client_epoch_ms = int(_cse) if _cse else None
+    except Exception:
+        client_epoch_ms = None
+    server_epoch_ms = int(time.time() * 1000)
 
     # Normalize/resolve response format
     fmt = (req.response_format or req.format or "wav")
@@ -449,6 +464,9 @@ async def create_speech(req: SpeechRequest):
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
+            "X-Req-Id": req_id,
+            "X-Client-Request-Id": client_req_id or "",
+            "X-Server-Start-Epoch-Ms": str(server_epoch_ms),
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
@@ -461,6 +479,8 @@ async def create_speech(req: SpeechRequest):
                 watermark=req.watermark or "off",
                 req_id=req_id,
                 t0=time.perf_counter(),
+                client_epoch_ms=client_epoch_ms,
+                server_epoch_ms=server_epoch_ms,
                 primer_silence_ms=req.primer_silence_ms or 0,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 2),
                 first_chunk_chars=req.first_chunk_chars or 32,
@@ -472,6 +492,11 @@ async def create_speech(req: SpeechRequest):
         )
 
     # Non-streaming path: synthesize full audio then return as a single response
+    non_stream_headers = {
+        "X-Req-Id": req_id,
+        "X-Client-Request-Id": client_req_id or "",
+        "X-Server-Start-Epoch-Ms": str(server_epoch_ms),
+    }
     try:
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
@@ -486,10 +511,10 @@ async def create_speech(req: SpeechRequest):
 
         if fmt == "pcm16":
             pcm = _float32_to_pcm16_bytes(wav)
-            return Response(content=pcm, media_type=f"audio/pcm;rate={tts.sr};channels=1")
+            return Response(content=pcm, media_type=f"audio/pcm;rate={tts.sr};channels=1", headers=non_stream_headers)
         else:
             data = _pack_wav_bytes(wav, sr=tts.sr)
-            return Response(content=data, media_type="audio/wav")
+            return Response(content=data, media_type="audio/wav", headers=non_stream_headers)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
