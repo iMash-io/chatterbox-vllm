@@ -104,8 +104,6 @@ class SpeechRequest(BaseModel):
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
     max_tokens_first_chunk: Optional[int] = Field(default=None, ge=16, le=512, description="Max tokens for T3 on first chunk only")
     crossfade_ms: Optional[int] = Field(default=10, ge=0, le=50, description="Crossfade between chunk boundaries (ms) to reduce clicks")
-    tail_fade_ms: Optional[int] = Field(default=5, ge=0, le=50, description="Tail fade-out per chunk (ms) to reduce clicks")
-    head_fade_ms: Optional[int] = Field(default=0, ge=0, le=50, description="Head fade-in per chunk (ms) to reduce clicks")
 
 
 # ---------- Utilities ----------
@@ -272,8 +270,6 @@ async def _synthesize_streaming_pcm_frames(
     chunk_chars: int = 120,
     frame_ms: int = 20,
     crossfade_ms: int = 10,
-    tail_fade_ms: int = 5,
-    head_fade_ms: int = 0,
 ) -> Generator[bytes, None, None]:
     """
     Streaming generator:
@@ -345,9 +341,10 @@ async def _synthesize_streaming_pcm_frames(
         audio_ms = int(audio_samples * 1000 / sr) if sr else 0
         print(f"[TTS_CHUNK_DONE] req_id={req_id} idx={idx} chunk_ms={chunk_ms} steps={steps} audio_ms={audio_ms} samples={audio_samples} t_ms={int((time.perf_counter()-start)*1000)}")
 
-        # Optional minimal tail fade to avoid end clicks on chunk boundaries
-        fade_samples = int(sr * max(0, tail_fade_ms) / 1000)
-        if tail_fade_ms > 0 and wav.numel() > fade_samples and fade_samples > 0:
+        # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
+        fade_ms = 5
+        fade_samples = int(sr * fade_ms / 1000)
+        if wav.numel() > fade_samples and fade_samples > 0:
             tail = wav[:, -fade_samples:]
             ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
             tail_faded = tail * ramp
@@ -376,13 +373,6 @@ async def _synthesize_streaming_pcm_frames(
 
         if applied_cross:
             print(f"[TTS_CROSSFADE] req_id={req_id} idx={idx} samples={applied_cross}")
-
-        # Optional head fade-in to soften entry of chunk after crossfade/mix
-        head_samples = int(sr * max(0, head_fade_ms) / 1000)
-        if head_fade_ms > 0 and wav.numel() > head_samples and head_samples > 0:
-            head = wav[:, :head_samples]
-            head_ramp = torch.linspace(0.95, 1.0, steps=head_samples, device=head.device, dtype=head.dtype).unsqueeze(0)
-            wav[:, :head_samples] = head * head_ramp
 
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
@@ -529,8 +519,6 @@ async def create_speech(req: SpeechRequest, request: Request):
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
                 crossfade_ms=req.crossfade_ms or 10,
-                tail_fade_ms=req.tail_fade_ms or 5,
-                head_fade_ms=req.head_fade_ms or 0,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,
