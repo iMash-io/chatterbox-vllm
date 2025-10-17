@@ -1,17 +1,31 @@
-import torch
+#!/usr/bin/env python3
+import argparse
+from typing import Any, Optional, Tuple, Union, List, Dict
+
 import numpy as np
-from typing import Any, Optional, Tuple, Union, List
+import torch
+
+try:
+    import torchaudio as ta
+except Exception:
+    ta = None
+
 from chatterbox_vllm.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox_vllm.tts import ChatterboxTTS
 
 
 class ChatterboxVLLMWrapper:
     """
-    Wrapper for ChatterboxMultilingualTTS with vLLM backend.
-    Provides a consistent API for TTS generation with caching and conditioning.
+    Wrapper for Chatterbox TTS with vLLM backend.
+    Provides a consistent API and supports:
+      - mode="multi": multilingual, via ChatterboxMultilingualTTS
+      - mode="single": English-only, via ChatterboxTTS
     """
-    
+
     def __init__(
-        self, 
+        self,
+        *,
+        mode: str = "multi",           # "multi" or "single"
         device: str = "cuda",
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 1000,
@@ -19,24 +33,14 @@ class ChatterboxVLLMWrapper:
         compile: bool = False,
         s3gen_use_fp16: bool = False,
         diffusion_steps: int = 10,
+        use_local_ckpt: Optional[str] = None,
     ) -> None:
-        """
-        Initialize the Chatterbox model wrapper.
-        
-        Args:
-            device: Device to run the model on (default: "cuda")
-            gpu_memory_utilization: Fraction of GPU memory for vLLM (default: 0.4)
-            max_model_len: Maximum model length in tokens (default: 1000)
-            enforce_eager: Disable CUDA graphs for faster startup (default: False)
-            compile: Compile the model for better performance (default: False)
-            s3gen_use_fp16: Use FP16 for S3Gen (default: False)
-            diffusion_steps: Number of diffusion steps for audio generation (default: 10)
-        """
+        assert mode in ("multi", "single"), "mode must be 'multi' or 'single'"
+        self.mode = mode
         self.device = device
         self.diffusion_steps = diffusion_steps
-        
-        print(f"Loading Chatterbox vLLM model on {device}...")
-        self.model = ChatterboxMultilingualTTS.from_pretrained(
+
+        common_kwargs = dict(
             target_device=device,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
@@ -44,57 +48,73 @@ class ChatterboxVLLMWrapper:
             compile=compile,
             s3gen_use_fp16=s3gen_use_fp16,
         )
-        
+
+        print(f"Loading Chatterbox vLLM model (mode={mode}) on {device}...")
+        if mode == "multi":
+            if use_local_ckpt:
+                self.model = ChatterboxMultilingualTTS.from_local(
+                    ckpt_dir=use_local_ckpt,
+                    **{k: v for k, v in common_kwargs.items() if k not in ("gpu_memory_utilization", "enforce_eager")}
+                )
+            else:
+                self.model = ChatterboxMultilingualTTS.from_pretrained(**common_kwargs)
+        else:
+            if use_local_ckpt:
+                self.model = ChatterboxTTS.from_local(
+                    ckpt_dir=use_local_ckpt,
+                    target_device=device,
+                    variant="english",
+                    compile=compile,
+                    s3gen_use_fp16=s3gen_use_fp16,
+                    max_model_len=max_model_len,
+                )
+            else:
+                self.model = ChatterboxTTS.from_pretrained(
+                    target_device=device,
+                    s3gen_use_fp16=s3gen_use_fp16,
+                    compile=compile,
+                    max_model_len=max_model_len,
+                )
+
         self.sr = self.model.sr
-        
+
         # Cache for audio conditionals
-        self._cached_conditionals = {}
-        
+        self._cached_conditionals: Dict[str, Tuple[dict, torch.Tensor]] = {}
+
         print("Chatterbox vLLM model loaded successfully!")
 
     def get_conditioning_latents(
-        self, 
+        self,
         audio_path: Optional[str] = None,
         exaggeration: float = 0.5
     ) -> Tuple[dict, torch.Tensor, Optional[np.ndarray]]:
         """
         Get conditioning latents for the model.
-        
+
         Args:
             audio_path: Path to reference audio file (None for default voice)
             exaggeration: Emotion exaggeration level (0.0-1.0)
-            
-        Returns:
-            Tuple of (s3gen_ref_dict, cond_emb, speaker_embedding)
         """
-        # Use cached conditionals if available
         cache_key = audio_path or "default"
         if cache_key not in self._cached_conditionals:
             s3gen_ref, cond_emb = self.model.get_audio_conditionals(audio_path)
             self._cached_conditionals[cache_key] = (s3gen_ref, cond_emb)
         else:
             s3gen_ref, cond_emb = self._cached_conditionals[cache_key]
-        
+
         # Update exaggeration if needed
         cond_emb = self.model.update_exaggeration(cond_emb, exaggeration)
-        
-        # Extract speaker embedding if available (for compatibility)
+
+        # Placeholder for compatibility (not used)
         speaker_embedding = None
-        
         return s3gen_ref, cond_emb, speaker_embedding
 
     def prepare_conditionals(
-        self, 
+        self,
         audio_path: Optional[str] = None,
         exaggeration: float = 0.5
     ) -> None:
-        """
-        Prepare and cache conditionals for inference.
-        
-        Args:
-            audio_path: Path to reference audio file
-            exaggeration: Emotion exaggeration level (0.0-1.0)
-        """
+        """Prepare and cache conditionals for inference."""
         self.get_conditioning_latents(audio_path, exaggeration)
 
     def inference(
@@ -111,24 +131,18 @@ class ChatterboxVLLMWrapper:
     ) -> dict:
         """
         Generate speech from text.
-        
+
         Args:
             text: Input text or list of texts
-            lang: Language code(s) (e.g., 'en', 'es', 'zh')
+            lang: Language code(s); used only in mode='multi'. Ignored in 'single' (assumed 'en').
             audio_prompt_path: Path to reference audio for voice cloning
-            temperature: Sampling temperature
-            top_p: Top-p sampling parameter
-            repetition_penalty: Repetition penalty
-            exaggeration: Emotion exaggeration level (0.0-1.0)
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            Dictionary with 'wav' key containing audio tensor(s) in shape [channels, samples]
         """
-        # Generate audio
+        # Route language_id based on mode
+        language_id = lang if self.mode == "multi" else "en"
+
         audios = self.model.generate(
             prompts=text,
-            language_id=lang,
+            language_id=language_id,
             audio_prompt_path=audio_prompt_path,
             exaggeration=exaggeration,
             temperature=temperature,
@@ -138,36 +152,8 @@ class ChatterboxVLLMWrapper:
             diffusion_steps=self.diffusion_steps,
             **kwargs
         )
-        
-        # Ensure audio is in correct format [channels, samples]
-        if isinstance(text, str):
-            # Single input - return single audio
-            wav = audios[0]
-            if isinstance(wav, torch.Tensor):
-                wav = wav.detach().cpu()
-                # Ensure 2D format [channels, samples]
-                if wav.dim() == 1:
-                    wav = wav.unsqueeze(0)
-            else:
-                # Convert numpy to torch for consistent output
-                wav = torch.from_numpy(wav)
-                if wav.dim() == 1:
-                    wav = wav.unsqueeze(0)
-            return {"wav": wav}
-        else:
-            # Batch input - return list of audios
-            wavs = []
-            for audio in audios:
-                if isinstance(audio, torch.Tensor):
-                    audio = audio.detach().cpu()
-                    if audio.dim() == 1:
-                        audio = audio.unsqueeze(0)
-                else:
-                    audio = torch.from_numpy(audio)
-                    if audio.dim() == 1:
-                        audio = audio.unsqueeze(0)
-                wavs.append(audio)
-            return {"wav": wavs}
+
+        return self._normalize_audio_output(text, audios)
 
     def inference_with_conds(
         self,
@@ -184,26 +170,14 @@ class ChatterboxVLLMWrapper:
     ) -> dict:
         """
         Generate speech with pre-computed conditionals.
-        
-        Args:
-            text: Input text or list of texts
-            s3gen_ref: S3Gen reference dictionary
-            cond_emb: Conditioning embeddings
-            lang: Language code(s)
-            temperature: Sampling temperature
-            top_p: Top-p sampling parameter
-            repetition_penalty: Repetition penalty
-            exaggeration: Emotion exaggeration level
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            Dictionary with 'wav' key containing audio tensor(s) in shape [channels, samples]
         """
+        language_id = lang if self.mode == "multi" else "en"
+
         audios = self.model.generate_with_conds(
             prompts=text,
             s3gen_ref=s3gen_ref,
             cond_emb=cond_emb,
-            language_id=lang,
+            language_id=language_id,
             temperature=temperature,
             exaggeration=exaggeration,
             max_tokens=max_tokens,
@@ -212,36 +186,14 @@ class ChatterboxVLLMWrapper:
             diffusion_steps=self.diffusion_steps,
             **kwargs
         )
-        
-        # Ensure audio is in correct format [channels, samples]
-        if isinstance(text, str):
-            wav = audios[0]
-            if isinstance(wav, torch.Tensor):
-                wav = wav.detach().cpu()
-                if wav.dim() == 1:
-                    wav = wav.unsqueeze(0)
-            else:
-                wav = torch.from_numpy(wav)
-                if wav.dim() == 1:
-                    wav = wav.unsqueeze(0)
-            return {"wav": wav}
-        else:
-            wavs = []
-            for audio in audios:
-                if isinstance(audio, torch.Tensor):
-                    audio = audio.detach().cpu()
-                    if audio.dim() == 1:
-                        audio = audio.unsqueeze(0)
-                else:
-                    audio = torch.from_numpy(audio)
-                    if audio.dim() == 1:
-                        audio = audio.unsqueeze(0)
-                wavs.append(audio)
-            return {"wav": wavs}
+
+        return self._normalize_audio_output(text, audios)
 
     def get_supported_languages(self) -> dict:
         """Get dictionary of supported language codes and names."""
-        return self.model.get_supported_languages()
+        if self.mode == "multi":
+            return self.model.get_supported_languages()
+        return {"en": "English"}
 
     def clear_cache(self) -> None:
         """Clear cached conditionals."""
@@ -253,60 +205,114 @@ class ChatterboxVLLMWrapper:
         self.model.shutdown()
         self._cached_conditionals.clear()
 
+    def _normalize_audio_output(self, text: Union[str, List[str]], audios: List[torch.Tensor]) -> dict:
+        """
+        Ensure audio is in [channels, samples] torch.FloatTensor(1, T).
+        """
+        def to_2d_tensor(wav_like) -> torch.Tensor:
+            if isinstance(wav_like, torch.Tensor):
+                wav = wav_like.detach().cpu()
+            else:
+                wav = torch.from_numpy(np.asarray(wav_like))
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            return wav
 
-# Example usage
-if __name__ == "__main__":
-    import torchaudio as ta
-    
-    # Initialize wrapper
+        if isinstance(text, str):
+            return {"wav": to_2d_tensor(audios[0])}
+        else:
+            return {"wav": [to_2d_tensor(w) for w in audios]}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Chatterbox vLLM Inference (single/multi)")
+    mode_group = p.add_mutually_exclusive_group()
+    mode_group.add_argument("--multi", action="store_true", help="Use multilingual model")
+    mode_group.add_argument("--single", action="store_true", help="Use English-only model")
+
+    p.add_argument("--device", default="cuda", help="Device to run the model on (cuda|cpu)")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.4, help="Fraction of GPU memory for vLLM")
+    p.add_argument("--max-model-len", type=int, default=1000, help="Max model length (tokens)")
+    p.add_argument("--enforce-eager", action="store_true", help="Disable CUDA graphs for faster startup")
+    p.add_argument("--compile", action="store_true", help="Compile the model for perf")
+    p.add_argument("--s3gen-fp16", action="store_true", help="Use FP16 for S3Gen")
+    p.add_argument("--diffusion-steps", type=int, default=10, help="Steps for S3Gen diffusion")
+    p.add_argument("--local-ckpt", type=str, default=None, help="Path to local checkpoint directory")
+    p.add_argument("--save-audio", action="store_true", help="Save example outputs to disk (requires torchaudio)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    mode = "multi" if (args.multi or not args.single) else "single"
+
     wrapper = ChatterboxVLLMWrapper(
-        device="cuda",
-        gpu_memory_utilization=0.4,
-        max_model_len=1000,
-        enforce_eager=True,
-        diffusion_steps=10,
+        mode=mode,
+        device=args.device,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        enforce_eager=args.enforce_eager,
+        compile=args.compile,
+        s3gen_use_fp16=args.s3gen_fp16,
+        diffusion_steps=args.diffusion_steps,
+        use_local_ckpt=args.local_ckpt,
     )
-    
+
     print(f"Sample rate: {wrapper.sr}")
     print(f"Supported languages: {wrapper.get_supported_languages()}")
-    
-    # Test with different audio prompts
-    audio_prompts = [None, "docs/audio-sample-01.mp3", "docs/audio-sample-03.mp3"]
-    
+
+    # Simple quick tests
+    audio_prompts = [None]  # optionally add your own prompt paths
+
     for i, audio_prompt_path in enumerate(audio_prompts):
-        print(f"\n=== Testing with audio prompt {i} ===")
-        
+        print(f"\n=== Testing with audio prompt {i} (mode={mode}) ===")
+
         # Single text generation
         text = "You are listening to a demo of the Chatterbox TTS model running on VLLM."
+        lang = "en" if mode == "single" else "en"
         result = wrapper.inference(
             text=text,
-            lang="en",
+            lang=lang,
             audio_prompt_path=audio_prompt_path,
             exaggeration=0.2,
             temperature=0.8,
         )
-        wav = result["wav"]  # Already in [channels, samples] format
-        ta.save(f"test-single-{i}.mp3", wav, wrapper.sr)
-        
+        wav = result["wav"]
+        if args.save_audio and ta is not None:
+            ta.save(f"test-single-{mode}-{i}.mp3", wav, wrapper.sr)
+
         # Batch generation
-        prompts = [
-            "You are listening to a demo of the Chatterbox TTS model running on VLLM.",
-            "Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox.",
-            "你好，今天天气真不错，希望你有一个愉快的周末。",
-        ]
-        
+        if mode == "multi":
+            prompts = [
+                "You are listening to a demo of the Chatterbox TTS model running on VLLM.",
+                "Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox.",
+                "שלום, מה שלומך? זהו מודל הדיבור הרב-לשוני של Chatterbox.",
+            ]
+            langs = ["en", "fr", "he"]
+        else:
+            prompts = [
+                "This is the English-only TTS model demo one.",
+                "This is the English-only TTS model demo two.",
+                "This is the English-only TTS model demo three.",
+            ]
+            langs = None  # ignored in single mode
+
         result = wrapper.inference(
             text=prompts,
-            lang=["en", "fr", "zh"],
+            lang=langs,
             audio_prompt_path=audio_prompt_path,
             exaggeration=0.2,
             temperature=0.8,
         )
-        
         wavs = result["wav"]
-        for audio_idx, wav in enumerate(wavs):
-            ta.save(f"test-batch-{i}-{audio_idx}.mp3", wav, wrapper.sr)
-    
+        if args.save_audio and ta is not None:
+            for audio_idx, wav in enumerate(wavs):
+                ta.save(f"test-batch-{mode}-{i}-{audio_idx}.mp3", wav, wrapper.sr)
+
     # Cleanup
     wrapper.shutdown()
     print("\nAll tests completed!")
+
+
+if __name__ == "__main__":
+    main()

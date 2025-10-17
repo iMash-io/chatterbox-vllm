@@ -223,26 +223,33 @@ def _apply_watermark_if_needed(wav: torch.Tensor, sr: int, watermark: str) -> to
 
 def _get_engine_for_language(language_id: Optional[str]) -> ChatterboxTTS:
     """
-    Return an engine appropriate for the requested language.
-    English -> 'english' engine; anything else -> 'multilingual' engine.
+    Return an engine appropriate for the requested language, honoring the server mode:
+      - If _variant == 'multilingual': always use multilingual engine (even for 'en')
+      - If _variant == 'english': always use english engine
+      - If _variant == 'auto': English -> 'english', anything else -> 'multilingual'
     Lazily loads and caches engines on first use.
     """
     normalized = (language_id or "en").lower()
-    variant = "english" if normalized == "en" else "multilingual"
+    if _variant == "multilingual":
+        desired_variant = "multilingual"
+    elif _variant == "english":
+        desired_variant = "english"
+    else:
+        desired_variant = "english" if normalized == "en" else "multilingual"
 
     # Fast path
-    engine = _engines.get(variant)
+    engine = _engines.get(desired_variant)
     if engine is not None:
         return engine
 
     # Lazy-load with lock to avoid duplicate loads
     with _engine_lock:
-        engine = _engines.get(variant)
+        engine = _engines.get(desired_variant)
         if engine is not None:
             return engine
 
         if _local_ckpt:
-            if variant == "multilingual":
+            if desired_variant == "multilingual":
                 engine = ChatterboxMultilingualTTS.from_local(
                     ckpt_dir=_local_ckpt,
                     target_device=_device,
@@ -258,7 +265,7 @@ def _get_engine_for_language(language_id: Optional[str]) -> ChatterboxTTS:
                     compile=_enable_compile,
                 )
         else:
-            if variant == "multilingual":
+            if desired_variant == "multilingual":
                 engine = ChatterboxMultilingualTTS.from_pretrained(
                     target_device=_device,
                     s3gen_use_fp16=_s3gen_use_fp16,
@@ -271,7 +278,7 @@ def _get_engine_for_language(language_id: Optional[str]) -> ChatterboxTTS:
                     compile=_enable_compile,
                 )
 
-        _engines[variant] = engine
+        _engines[desired_variant] = engine
         return engine
 
 
