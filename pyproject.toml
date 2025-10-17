@@ -28,7 +28,8 @@ dependencies = [
     "llvmlite>=0.44.0",
     "vllm==0.10.0",
     "gradio",
-    #"pkuseg",  # https://github.com/lancopku/pkuseg-python/issues/180
+    "russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub",
+    "spacy-pkuseg",
     "pykakasi",
 ]
 
