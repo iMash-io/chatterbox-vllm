@@ -443,12 +443,18 @@ class ChatterboxMultilingualTTS:
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
 
+            # Prepare stop token for logging
+            stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
+                      f"max_tokens={min(max_tokens, self.max_model_len)}, stop_token_ids={[stop_offset_id]}")
+
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
                     temperature=temp_use,
 
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                    stop_token_ids=[stop_offset_id],
                     max_tokens=min(max_tokens, self.max_model_len),
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
@@ -476,9 +482,29 @@ class ChatterboxMultilingualTTS:
                     # Truncate at the first emitted stop-of-speech token if present
                     stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
                     tok_ids = list(output.token_ids)
+
+                    # Debug: summarize EOS behavior
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        finish_reason = getattr(output, "finish_reason", None)
+                        stop_positions = [idx for idx, t in enumerate(tok_ids) if t == stop_offset_id]
+                        head = tok_ids[:10]
+                        tail = tok_ids[-10:]
+                        print(f"[T3][eos] finish_reason={finish_reason}, out_len={len(tok_ids)}, "
+                              f"stop_found={len(stop_positions)>0}, first_stop_idx={stop_positions[0] if stop_positions else None}, "
+                              f"head={head}, tail={tail}")
+
                     if stop_offset_id in tok_ids:
                         stop_idx = tok_ids.index(stop_offset_id)
+                        # Debug: how much we are removing
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
+                                  f"removed={len(tok_ids) - stop_idx}")
                         tok_ids = tok_ids[:stop_idx]
+                    else:
+                        # If no EOS, note whether we hit max_tokens
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            hit_max = len(tok_ids) >= min(max_tokens, self.max_model_len)
+                            print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
                     # Map back to base speech token space
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
