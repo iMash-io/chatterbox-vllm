@@ -336,9 +336,11 @@ class MTLTokenizer(PreTrainedTokenizer):
         elif language_id == 'ru':
             txt = add_russian_stress(txt)
         
-        # Prepend language token
+        # Prepend language token if not already present
         if language_id:
-            txt = f"[{language_id.lower()}]{txt}"
+            lang_tag = f"[{language_id.lower()}]"
+            if not txt.startswith(lang_tag):
+                txt = lang_tag + txt
         
         return txt
 
@@ -353,10 +355,18 @@ class MTLTokenizer(PreTrainedTokenizer):
         Returns:
             List of token strings
         """
+        # Detect leading language tag like "[he]" and extract it
+        if not language_id and isinstance(text, str) and text.startswith("[") and "]" in text[:8]:
+            tag = text[1:text.index("]")]
+            if 2 <= len(tag) <= 5 and tag.isalpha():
+                language_id = tag.lower()
+                text = text[text.index("]")+1:]
+                # print(f"[MTLTokenizer] Detected language tag in text: {language_id}")
+        
         # Apply preprocessing
         text = self.preprocess_text(text, language_id=language_id)
         
-        # Apply language-specific processing
+        # Apply language-specific processing (this will also ensure the tag is present once)
         text = self.apply_language_processing(text, language_id=language_id)
         
         # Replace spaces with SPACE token
@@ -427,6 +437,14 @@ class MTLTokenizer(PreTrainedTokenizer):
         Returns:
             List of token IDs or PyTorch tensor if return_tensors="pt"
         """
+        # Detect leading language tag if present (e.g., "[he]...")
+        if not language_id and isinstance(txt, str) and txt.startswith("[") and "]" in txt[:8]:
+            tag = txt[1:txt.index("]")]
+            if 2 <= len(tag) <= 5 and tag.isalpha():
+                language_id = tag.lower()
+                txt = txt[txt.index("]")+1:]
+                # print(f"[MTLTokenizer] Detected language tag in encode: {language_id}")
+        
         # Preprocess
         txt = self.preprocess_text(txt, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
         
