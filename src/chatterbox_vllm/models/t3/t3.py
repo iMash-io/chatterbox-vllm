@@ -134,7 +134,7 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         tokenizer = self.info.get_tokenizer()
-        processed_outputs = tokenizer(prompt, return_tensors="pt")
+        processed_outputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
         if processed_outputs['conditionals'] is not None:
             print("processed_outputs", processed_outputs['conditionals'].shape)
