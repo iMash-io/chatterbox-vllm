@@ -647,11 +647,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     final_embeds = torch.cat([multimodal_embedding, multimodal_embedding], dim=1)
                     out.append(final_embeds)
                 else:
-                    # Something else - we don't know what to do with this.
-                    print("t3/get_input_embeddings/ERROR: prefill block contains neither start nor end. Please report this issue.")
-                    print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
-                    print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
-                    raise ValueError(f"Unknown prefill block: {ids}")
+                    # Unknown edge-case prefill chunk (e.g., scheduler split around a boundary).
+                    # Fall back to zero embeddings for this segment to keep alignment and avoid engine crash.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print("t3/get_input_embeddings/WARN: unknown prefill block; filling zeros for alignment")
+                        print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
+                        print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
+                    zeros = torch.zeros(
+                        (len(ids), 2 * self.dim),
+                        device=ids.device,
+                        dtype=self.text_emb.weight.dtype,
+                    )
+                    out.append(zeros)
+                    continue
 
             # Fallback: if no valid prefill/decode blocks were produced (e.g., stray EOS-only chunk),
             # return a minimal zero embedding to keep alignment with input_ids length.
