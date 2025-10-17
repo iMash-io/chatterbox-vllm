@@ -416,14 +416,18 @@ class ChatterboxMultilingualTTS:
         request_items = []
         for p, lang_id in zip(prompts, language_ids):
             normalized = punc_norm(p)
-            # Do NOT inject [lang] token here; let tokenizer add it via language_id
-            text = f"[START]{normalized}[STOP]"
+            # Explicitly inject language tag to ensure correct language routing end-to-end.
+            if lang_id:
+                text = f"[{lang_id.lower()}][START]{normalized}[STOP]"
+            else:
+                text = f"[START]{normalized}[STOP]"
             item = {
                 "prompt": text,
                 "multi_modal_data": {
                     "conditionals": [cond_emb],
                 },
             }
+            # Keep tokenization_kwargs as a hint (safe if ignored)
             if lang_id:
                 item["tokenization_kwargs"] = {"language_id": lang_id.lower()}
             request_items.append(item)

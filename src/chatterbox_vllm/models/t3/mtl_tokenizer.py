@@ -9,6 +9,7 @@ import torch
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizer
 from huggingface_hub import hf_hub_download
+from chatterbox_vllm.text_utils import SUPPORTED_LANGUAGES
 
 
 # Special tokens
@@ -359,11 +360,11 @@ class MTLTokenizer(PreTrainedTokenizer):
         Returns:
             List of token strings
         """
-        # Detect leading language tag like "[he]" and extract it
+        # Detect leading language tag like "[he]" and extract it ONLY if it's a supported language code
         if not language_id and isinstance(text, str) and text.startswith("[") and "]" in text[:8]:
-            tag = text[1:text.index("]")]
-            if 2 <= len(tag) <= 5 and tag.isalpha():
-                language_id = tag.lower()
+            tag = text[1:text.index("]")].lower()
+            if tag in SUPPORTED_LANGUAGES:
+                language_id = tag
                 text = text[text.index("]")+1:]
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[MTLTokenizer][_tokenize] detected tag lang={language_id}")
@@ -445,11 +446,11 @@ class MTLTokenizer(PreTrainedTokenizer):
         Returns:
             List of token IDs or PyTorch tensor if return_tensors="pt"
         """
-        # Detect leading language tag if present (e.g., "[he]...")
+        # Detect leading language tag if present (e.g., "[he]...") ONLY if it's a supported language code
         if not language_id and isinstance(txt, str) and txt.startswith("[") and "]" in txt[:8]:
-            tag = txt[1:txt.index("]")]
-            if 2 <= len(tag) <= 5 and tag.isalpha():
-                language_id = tag.lower()
+            tag = txt[1:txt.index("]")].lower()
+            if tag in SUPPORTED_LANGUAGES:
+                language_id = tag
                 txt = txt[txt.index("]")+1:]
                 # print(f"[MTLTokenizer] Detected language tag in encode: {language_id}")
         

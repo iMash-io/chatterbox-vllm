@@ -221,6 +221,34 @@ def _apply_watermark_if_needed(wav: torch.Tensor, sr: int, watermark: str) -> to
 
 # ---------- Core synthesis helpers ----------
 
+def _detect_language(text: str) -> Optional[str]:
+    """
+    Heuristic language detector based on Unicode ranges.
+    Returns a BCP-47-ish 2-letter code matching the multilingual model's supported set.
+    Only used as a fallback when language_id is not provided.
+    """
+    if not text:
+        return None
+    # Hebrew
+    if any('\u0590' <= ch <= '\u05FF' for ch in text):
+        return "he"
+    # Arabic
+    if any('\u0600' <= ch <= '\u06FF' for ch in text):
+        return "ar"
+    # Cyrillic (Russian)
+    if any('\u0400' <= ch <= '\u04FF' for ch in text):
+        return "ru"
+    # Hangul (Korean)
+    if any('\uAC00' <= ch <= '\uD7AF' for ch in text):
+        return "ko"
+    # Hiragana/Katakana (Japanese)
+    if any('\u3040' <= ch <= '\u309F' for ch in text) or any('\u30A0' <= ch <= '\u30FF' for ch in text):
+        return "ja"
+    # CJK Unified Ideographs (Chinese)
+    if any('\u4E00' <= ch <= '\u9FFF' for ch in text):
+        return "zh"
+    return None
+
 def _ensure_engine() -> ChatterboxTTS:
     """
     Return the single initialized TTS engine. Raises if not initialized.
@@ -243,6 +271,13 @@ def _synthesize_one(
     Synthesize one prompt to a waveform (1, T) tensor.
     """
     tts = _ensure_engine()
+
+    # Auto-detect language if caller didn't provide one (important for Hebrew and others)
+    if isinstance(tts, ChatterboxMultilingualTTS) and (not language_id or not str(language_id).strip()):
+        autodetect = _detect_language(text)
+        if autodetect:
+            print(f"[Server] Auto-detected language_id='{autodetect}' from input text")
+            language_id = autodetect
 
     # For multilingual vLLM path, ensure special tokens aren't altered by tokenizer settings.
     extra_sampling_kwargs = {}
