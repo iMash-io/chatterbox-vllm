@@ -250,6 +250,7 @@ def _synthesize_one(
         extra_sampling_kwargs = {
             "spaces_between_special_tokens": False,
             "skip_special_tokens": False,
+            "ignore_eos": True,
         }
 
     waves = tts.generate(
@@ -435,6 +436,7 @@ async def _startup() -> None:
             warm_extra_sampling_kwargs = {
                 "spaces_between_special_tokens": False,
                 "skip_special_tokens": False,
+                "ignore_eos": True,
             }
 
         _ = _tts_engine.generate(
