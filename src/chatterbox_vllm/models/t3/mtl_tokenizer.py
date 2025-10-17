@@ -312,6 +312,8 @@ class MTLTokenizer(PreTrainedTokenizer):
         if nfkd_normalize:
             preprocessed_text = normalize("NFKD", preprocessed_text)
         
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[MTLTokenizer][preprocess] lang={language_id} in='{raw_text[:80]}' out='{preprocessed_text[:80]}'")
         return preprocessed_text
 
     def apply_language_processing(self, txt: str, language_id: str = None):
@@ -342,6 +344,8 @@ class MTLTokenizer(PreTrainedTokenizer):
             if not txt.startswith(lang_tag):
                 txt = lang_tag + txt
         
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[MTLTokenizer][langproc] lang={language_id} out='{txt[:80]}'")
         return txt
 
     def _tokenize(self, text: str, language_id: str = None, **kwargs) -> List[str]:
@@ -361,7 +365,8 @@ class MTLTokenizer(PreTrainedTokenizer):
             if 2 <= len(tag) <= 5 and tag.isalpha():
                 language_id = tag.lower()
                 text = text[text.index("]")+1:]
-                # print(f"[MTLTokenizer] Detected language tag in text: {language_id}")
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[MTLTokenizer][_tokenize] detected tag lang={language_id}")
         
         # Apply preprocessing
         text = self.preprocess_text(text, language_id=language_id)
@@ -372,7 +377,10 @@ class MTLTokenizer(PreTrainedTokenizer):
         # Replace spaces with SPACE token
         text = text.replace(' ', SPACE)
         
-        return self.tokenizer.encode(text).tokens
+        toks = self.tokenizer.encode(text).tokens
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[MTLTokenizer][_tokenize] lang={language_id} toks_len={len(toks)} head={toks[:16]}")
+        return toks
 
     def _convert_token_to_id(self, token: str) -> int:
         return self.tokenizer.token_to_id(token)
@@ -457,6 +465,8 @@ class MTLTokenizer(PreTrainedTokenizer):
         # Encode
         ids = self.tokenizer.encode(txt).ids
         
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[MTLTokenizer][encode] lang={language_id} ids_len={len(ids)} head={ids[:16]}")
         if return_tensors == "pt":
             return torch.IntTensor(ids).unsqueeze(0)
         return ids

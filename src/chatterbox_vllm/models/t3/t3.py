@@ -141,7 +141,17 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             tag = f"[{_lang.lower()}]"
             if not prompt.startswith(tag):
                 prompt = tag + prompt
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[T3Processor][_call_hf_processor] lang={_lang} prompt='{prompt[:120]}'")
         processed_outputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            try:
+                _ids = processed_outputs.get("input_ids", None)
+                if _ids is not None:
+                    _ids0 = _ids[0].tolist() if hasattr(_ids, "tolist") else []
+                    print(f"[T3Processor][_call_hf_processor] input_ids_len={len(_ids0)} head={_ids0[:16]}")
+            except Exception as _e:
+                print(f"[T3Processor][_call_hf_processor] debug error: {_e}")
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
         if processed_outputs['conditionals'] is not None:
             print("processed_outputs", processed_outputs['conditionals'].shape)
@@ -186,6 +196,14 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             # Skip prompt caching calculation for now
             return_mm_hashes=False,
         )
+
+        # Debug: show prompt_ids before/after sanitize
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            try:
+                _ids_dbg = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else (prompt_ids if isinstance(prompt_ids, list) else [])
+                print(f"[T3Processor][apply] prompt_ids.len={len(_ids_dbg)} head={_ids_dbg[:16]}")
+            except Exception as _e:
+                print(f"[T3Processor][apply] prompt_ids debug error: {_e}")
 
         # Sanitize: remove any LLaMA EOS tokens (id=2) that can break prefill parsing
         try:
@@ -250,6 +268,13 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
                 )
             )
         ])
+
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            try:
+                print(f"[T3Processor][apply] final_prompt_ids.len={len(final_prompt_ids)} head={final_prompt_ids[:16]}")
+                print(f"[T3Processor][apply] new_conditionals.shape={new_conditionals.shape}")
+            except Exception as _e:
+                print(f"[T3Processor][apply] final ids debug error: {_e}")
 
         return MultiModalInputs(
             type="multimodal",
@@ -414,6 +439,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
             # Check if we've swapped between prefill and decode blocks, or if we've just hit the start of a new prefill block
             if (in_prefill_block != (input_id < SPEECH_TOKEN_OFFSET)) or (input_id == PREFILL_COND_START_TOKEN):
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[T3Processor][split] switch block in_prefill={in_prefill_block} buf_len={len(buffer)} tok={int(input_id)}")
                 if buffer:
                     if in_prefill_block:
                         # assert len(remaining_multimodal_embeddings) >= len(buffer), "Not enough remaining multimodal embeddings"
@@ -438,6 +465,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                 output.append((torch.tensor(buffer).to(input_ids.device), mme))
             else:
                 output.append((torch.tensor(buffer).to(input_ids.device), None))
+
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            try:
+                print(f"[T3Processor][split] segments={len(output)} " +
+                      (f"first_len={len(output[0][0])} first_prefill={output[0][1] is not None}" if output else ""))
+            except Exception as _e:
+                print(f"[T3Processor][split] debug error: {_e}")
 
         # if len(remaining_multimodal_embeddings) > 0:
         #     print("t3/split_prefill_decode/input_ids", input_ids)
@@ -501,6 +535,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
                 if ids[0] == PREFILL_COND_START_TOKEN and ids[-1] == PREFILL_END_TOKEN:
                     # We have the full prefill block.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3Processor][embeds] full prefill ids_len={len(ids)}")
 
                     # The first 34 tokens are the cond portion. The remainder, except for the last token are the text
                     # portion. The last token is a placeholder for the start of speech token.
@@ -521,6 +557,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     out.append(final_embeds)
                 elif ids[0] == PREFILL_COND_START_TOKEN:
                     # We have the start of the prefill block.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3Processor][embeds] start prefill ids_len={len(ids)}")
                     # The only thing we an assume here is that we don't have the end token, so we can skip the start of speech token.
                     # print("t3/get_input_embeddings/start of prefill block")
 
@@ -542,6 +580,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     out.append(final_embeds)
                 elif ids[-1] == PREFILL_END_TOKEN:
                     # We have the end of the prefill block.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3Processor][embeds] end prefill ids_len={len(ids)}")
                     # The only thing we an assume here is that we have the start of speech token,
                     # and that our conditioning embeddings will at minimum be truncated. We can't
                     # assume anything about the text portion.
