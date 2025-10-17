@@ -180,6 +180,19 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             return_mm_hashes=False,
         )
 
+        # Sanitize: remove any LLaMA EOS tokens (id=2) that can break prefill parsing
+        try:
+            if isinstance(prompt_ids, torch.Tensor):
+                prompt_ids = prompt_ids.tolist()
+            if isinstance(prompt_ids, list):
+                before_len = len(prompt_ids)
+                prompt_ids = [pid for pid in prompt_ids if pid != 2]
+                after_len = len(prompt_ids)
+                if before_len != after_len:
+                    print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
+        except Exception as _e:
+            print(f"t3/apply: sanitize prompt_ids failed: {_e}")
+
         # We are going to apply custom logic to squish the embeddings in the right format.
         # The final embedding will look like <| cond | text | speech |>
         #
@@ -384,6 +397,14 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # Every time we swtich between block states, add the current buffer to the output if not empty
         # If we we switch out of block mode, add the multimodal embedding
         for input_id in input_ids:
+            # Skip stray EOS (id=2) tokens in prefill stream; not part of T3 prefill markers
+            try:
+                if int(input_id) == 2:
+                    # print("t3/split_prefill_decode: skipping EOS token id=2")
+                    continue
+            except Exception:
+                pass
+
             # Check if we've swapped between prefill and decode blocks, or if we've just hit the start of a new prefill block
             if (in_prefill_block != (input_id < SPEECH_TOKEN_OFFSET)) or (input_id == PREFILL_COND_START_TOKEN):
                 if buffer:
@@ -569,6 +590,21 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
                     print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
                     raise ValueError(f"Unknown prefill block: {ids}")
+
+            # Fallback: if no valid prefill/decode blocks were produced (e.g., stray EOS-only chunk),
+            # return a minimal zero embedding to keep alignment with input_ids length.
+            if len(out) == 0:
+                try:
+                    zeros = torch.zeros(
+                        (len(input_ids), 2 * self.dim),
+                        device=input_ids.device,
+                        dtype=self.text_emb.weight.dtype,
+                    )
+                    # print("t3/get_input_embeddings/fallback: returning zero embeds for stray block")
+                    return zeros
+                except Exception as _e:
+                    print(f"t3/get_input_embeddings/fallback failed: {_e}")
+                    raise
 
             output = torch.cat(out, dim=0)
 
