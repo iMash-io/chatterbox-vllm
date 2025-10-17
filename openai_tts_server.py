@@ -46,7 +46,7 @@ Run:
   - POST to: http://localhost:8000/v1/audio/speech
 
 Environment Variables:
-  - CHATTERBOX_VARIANT: "english" (default) | "multilingual"
+  - CHATTERBOX_VARIANT: "auto" (default) | "english" | "multilingual"
   - CHATTERBOX_DEVICE: "cuda" (default if available) | "cpu"
   - CHATTERBOX_S3GEN_FP16: "0" | "1" (default "0")
   - CHATTERBOX_USE_LOCAL_CKPT: path to local checkpoint dir (else uses HF from_pretrained)
@@ -59,6 +59,7 @@ import sys
 import io
 import math
 import asyncio
+import threading
 from typing import Optional, Iterable, Generator, List, Tuple
 
 # Ensure `src/` is importable when running from repo root
@@ -76,9 +77,16 @@ from chatterbox_vllm.tts import ChatterboxTTS
 
 APP = FastAPI(title="OpenAI-compatible TTS for chatterbox-vllm")
 
-# Global singleton TTS engine (initialized on startup)
-_tts_engine: Optional[ChatterboxTTS] = None
-_tts_sr: int = 24000  # default, will be updated from engine.sr
+# Engine cache and configuration (initialized on startup)
+_engines: dict[str, ChatterboxTTS] = {}
+_engine_lock = threading.Lock()
+
+# Runtime config captured at startup and reused for lazy loads
+_device: str = "cuda" if torch.cuda.is_available() else "cpu"
+_variant: str = "auto"  # 'auto' (default), 'english', or 'multilingual'
+_s3gen_use_fp16: bool = False
+_local_ckpt: Optional[str] = None
+_enable_compile: bool = False
 
 
 # ---------- Request/Response Schemas ----------
@@ -212,11 +220,50 @@ def _apply_watermark_if_needed(wav: torch.Tensor, sr: int, watermark: str) -> to
 
 # ---------- Core synthesis helpers ----------
 
-def _ensure_engine() -> ChatterboxTTS:
-    global _tts_engine
-    if _tts_engine is None:
-        raise RuntimeError("TTS engine not initialized")
-    return _tts_engine
+def _get_engine_for_language(language_id: Optional[str]) -> ChatterboxTTS:
+    """
+    Return an engine appropriate for the requested language.
+    English -> 'english' engine; anything else -> 'multilingual' engine.
+    Lazily loads and caches engines on first use.
+    """
+    normalized = (language_id or "en").lower()
+    variant = "english" if normalized == "en" else "multilingual"
+
+    # Fast path
+    engine = _engines.get(variant)
+    if engine is not None:
+        return engine
+
+    # Lazy-load with lock to avoid duplicate loads
+    with _engine_lock:
+        engine = _engines.get(variant)
+        if engine is not None:
+            return engine
+
+        if _local_ckpt:
+            engine = ChatterboxTTS.from_local(
+                ckpt_dir=_local_ckpt,
+                target_device=_device,
+                variant=("english" if variant == "english" else "multilingual"),
+                s3gen_use_fp16=_s3gen_use_fp16,
+                compile=_enable_compile,
+            )
+        else:
+            if variant == "multilingual":
+                engine = ChatterboxTTS.from_pretrained_multilingual(
+                    target_device=_device,
+                    s3gen_use_fp16=_s3gen_use_fp16,
+                    compile=_enable_compile,
+                )
+            else:
+                engine = ChatterboxTTS.from_pretrained(
+                    target_device=_device,
+                    s3gen_use_fp16=_s3gen_use_fp16,
+                    compile=_enable_compile,
+                )
+
+        _engines[variant] = engine
+        return engine
 
 
 def _synthesize_one(
@@ -231,7 +278,7 @@ def _synthesize_one(
     """
     Synthesize one prompt to a waveform (1, T) tensor.
     """
-    tts = _ensure_engine()
+    tts = _get_engine_for_language(language_id)
     waves = tts.generate(
         prompts=text,
         audio_prompt_path=audio_prompt_path,
@@ -268,7 +315,7 @@ async def _synthesize_streaming_pcm_frames(
       - Convert to PCM16 and yield small frames immediately
       - Continue with subsequent chunks (full quality)
     """
-    tts = _ensure_engine()
+    tts = _get_engine_for_language(language_id)
     sr = tts.sr
 
     # Optional primer silence to flush headers immediately and force chunked streaming
@@ -338,69 +385,48 @@ async def _synthesize_streaming_pcm_frames(
 @APP.on_event("startup")
 async def _startup() -> None:
     """
-    Initialize and warm the TTS engine in memory for production-ready TTFA.
+    Initialize config and optionally preload an engine. Default behavior is 'auto':
+    lazy-load per-request; preload English for lower TTFA.
     """
-    global _tts_engine, _tts_sr
+    global _device, _variant, _s3gen_use_fp16, _local_ckpt, _enable_compile
 
-    # Device config
-    device = os.environ.get("CHATTERBOX_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-    variant = os.environ.get("CHATTERBOX_VARIANT", "english").strip().lower()
-    s3gen_use_fp16 = os.environ.get("CHATTERBOX_S3GEN_FP16", "0").strip() in ("1", "true", "True")
-    local_ckpt = os.environ.get("CHATTERBOX_USE_LOCAL_CKPT", "").strip() or None
-    enable_compile = os.environ.get("CHATTERBOX_COMPILE", "0").strip().lower() in ("1","true","yes","on")
+    # Capture runtime config
+    _device = os.environ.get("CHATTERBOX_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+    _variant = os.environ.get("CHATTERBOX_VARIANT", "auto").strip().lower()
+    _s3gen_use_fp16 = os.environ.get("CHATTERBOX_S3GEN_FP16", "0").strip() in ("1", "true", "True")
+    _local_ckpt = os.environ.get("CHATTERBOX_USE_LOCAL_CKPT", "").strip() or None
+    _enable_compile = os.environ.get("CHATTERBOX_COMPILE", "0").strip().lower() in ("1","true","yes","on")
 
-    # Load engine (avoid modifying repo code by using exported constructors)
-    if local_ckpt:
-        _tts_engine = ChatterboxTTS.from_local(
-            ckpt_dir=local_ckpt,
-            target_device=device,
-            variant=("english" if variant != "multilingual" else "multilingual"),
-            s3gen_use_fp16=s3gen_use_fp16,
-            compile=enable_compile,
-        )
-    else:
-        if variant == "multilingual":
-            _tts_engine = ChatterboxTTS.from_pretrained_multilingual(
-                target_device=device,
-                s3gen_use_fp16=s3gen_use_fp16,
-                compile=enable_compile,
-            )
-        else:
-            _tts_engine = ChatterboxTTS.from_pretrained(
-                target_device=device,
-                s3gen_use_fp16=s3gen_use_fp16,
-                compile=enable_compile,
-            )
-
-    _tts_sr = _tts_engine.sr
-
-    # Warm up: load conditionals and run a tiny synthesis to prime caches
-    warm_text = os.environ.get("CHATTERBOX_WARMUP_TEXT", "Hello")
+    # Decide which engine (if any) to preload and warm
+    to_prewarm_variant = "english" if _variant in ("english", "auto", "") else "multilingual"
     try:
+        engine = _get_engine_for_language("en" if to_prewarm_variant == "english" else "zh")
+        warm_text = os.environ.get("CHATTERBOX_WARMUP_TEXT", "Hello")
         # Precompute audio conditionals (default) and do a small diffusion (fast)
-        _ = _tts_engine.get_audio_conditionals(None)
-        _ = _tts_engine.generate(
+        _ = engine.get_audio_conditionals(None)
+        _ = engine.generate(
             prompts=warm_text,
-            language_id="en" if variant != "multilingual" else "en",
+            language_id="en",
             diffusion_steps=int(os.environ.get("CHATTERBOX_WARMUP_DIFF_STEPS", "2")),
-            max_tokens=min(32, _tts_engine.max_model_len),
+            max_tokens=min(32, engine.max_model_len),
         )
     except Exception as e:
-        # Proceed anyway; the first request may pay the warmup cost if this fails.
         print(f"[WARN] Warmup failed: {e}")
 
-    print(f"[INIT] TTS engine ready on device={device}, variant={variant}, sr={_tts_sr}, compile={enable_compile}")
+    loaded = ",".join(sorted(_engines.keys())) or "(none)"
+    print(f"[INIT] TTS server ready on device={_device}, mode={_variant}, preloaded={loaded}, sr=24000, compile={_enable_compile}")
 
 
 @APP.on_event("shutdown")
 async def _shutdown() -> None:
-    global _tts_engine
     try:
-        if _tts_engine is not None:
-            _tts_engine.shutdown()
-    except Exception:
-        pass
-    _tts_engine = None
+        for eng in list(_engines.values()):
+            try:
+                eng.shutdown()
+            except Exception:
+                pass
+    finally:
+        _engines.clear()
 
 
 # ---------- API Routes ----------
@@ -410,7 +436,7 @@ async def create_speech(req: SpeechRequest):
     """
     OpenAI-compatible TTS endpoint. Supports streaming and non-streaming.
     """
-    tts = _ensure_engine()
+    tts = _get_engine_for_language(req.language_id)
 
     # Normalize/resolve response format
     fmt = (req.response_format or req.format or "wav")
@@ -474,7 +500,7 @@ def _print_usage():
     print("  python openai_tts_server.py")
     print("")
     print("Environment variables:")
-    print("  CHATTERBOX_VARIANT=english|multilingual")
+    print("  CHATTERBOX_VARIANT=auto|english|multilingual")
     print("  CHATTERBOX_DEVICE=cuda|cpu")
     print("  CHATTERBOX_S3GEN_FP16=0|1")
     print("  CHATTERBOX_USE_LOCAL_CKPT=/path/to/ckpt_dir")
