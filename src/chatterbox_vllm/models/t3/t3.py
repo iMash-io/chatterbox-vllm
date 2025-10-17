@@ -564,40 +564,11 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         out.append(final_embeds)
 
                 else:
-                    # Middle of prefill block (neither start nor end present).
-                    # Handle arbitrary splits by classifying rows of the multimodal embedding:
-                    #  - Triangular rows (0/1 values) encode text positions -> use text embeddings + positional enc
-                    #  - Non-binary rows are conditioning -> pass conditioning through both CFG branches
-                    mme = multimodal_embedding
-                    # Identify rows that come from the triangular position hack (all elements 0 or 1).
-                    tri_mask = (torch.isclose(mme, torch.zeros_like(mme)) | torch.isclose(mme, torch.ones_like(mme)))
-                    tri_rows = torch.all(tri_mask, dim=1)
-                    cond_rows = ~tri_rows
-
-                    cond_stack = []
-                    uncond_stack = []
-
-                    for j in range(len(ids)):
-                        if tri_rows[j]:
-                            tok_id = ids[j]
-                            # Derive absolute text position from the row sum (number of ones) minus 1.
-                            pos = int(torch.sum(mme[j]).item()) - 1
-                            # Clamp to available precomputed text positions
-                            pos = max(0, min(self.precomputed_text_pos_emb.shape[0] - 1, pos))
-                            # Build text embedding with position
-                            te = self.text_emb(tok_id.view(1))[0] + self.precomputed_text_pos_emb[pos:pos+1][0]
-                            cond_stack.append(te)
-                            uncond_stack.append(torch.zeros_like(te))
-                        else:
-                            # Conditioning rows are included in both cond and uncond branches
-                            ce = mme[j]
-                            cond_stack.append(ce)
-                            uncond_stack.append(ce)
-
-                    cond_stack = torch.stack(cond_stack, dim=0)
-                    uncond_stack = torch.stack(uncond_stack, dim=0)
-                    final_embeds = torch.cat([cond_stack, uncond_stack], dim=1)
-                    out.append(final_embeds)
+                    # Something else - we don't know what to do with this.
+                    print("t3/get_input_embeddings/ERROR: prefill block contains neither start nor end. Please report this issue.")
+                    print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
+                    print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
+                    raise ValueError(f"Unknown prefill block: {ids}")
 
             output = torch.cat(out, dim=0)
 
