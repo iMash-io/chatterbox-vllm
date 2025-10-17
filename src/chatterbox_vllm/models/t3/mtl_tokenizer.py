@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import re
 from typing import List, Optional, Union
 from pathlib import Path
 from unicodedata import category, normalize
@@ -306,12 +307,17 @@ class MTLTokenizer(PreTrainedTokenizer):
     def preprocess_text(self, raw_text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
         """
         Text preprocessor that handles lowercase conversion and NFKD normalization.
+        Preserves special tokens [START] and [STOP] in canonical casing so they are recognized by the vocab.
         """
         preprocessed_text = raw_text
         if lowercase:
             preprocessed_text = preprocessed_text.lower()
         if nfkd_normalize:
             preprocessed_text = normalize("NFKD", preprocessed_text)
+
+        # Restore special tokens to canonical casing after lowercasing/normalization
+        preprocessed_text = re.sub(r"\[start\]", "[START]", preprocessed_text)
+        preprocessed_text = re.sub(r"\[stop\]", "[STOP]", preprocessed_text)
         
         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
             print(f"[MTLTokenizer][preprocess] lang={language_id} in='{raw_text[:80]}' out='{preprocessed_text[:80]}'")
