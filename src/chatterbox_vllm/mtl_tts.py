@@ -412,29 +412,26 @@ class ChatterboxMultilingualTTS:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
-        # Norm and tokenize text
-        # Prepend language token if specified
-        prepared_prompts = []
+        # Norm and prepare text; pass language_id via tokenization kwargs to tokenizer
+        request_items = []
         for p, lang_id in zip(prompts, language_ids):
             normalized = punc_norm(p)
+            # Do NOT inject [lang] token here; let tokenizer add it via language_id
+            text = f"[START]{normalized}[STOP]"
+            item = {
+                "prompt": text,
+                "multi_modal_data": {
+                    "conditionals": [cond_emb],
+                },
+            }
             if lang_id:
-                text = f"[START][{lang_id.lower()}]{normalized}[STOP]"
-            else:
-                text = f"[START]{normalized}[STOP]"
-            prepared_prompts.append(text)
+                item["tokenization_kwargs"] = {"language_id": lang_id.lower()}
+            request_items.append(item)
 
         with torch.inference_mode():
             start_time = time.time()
             batch_results = self.t3.generate(
-                [
-                    {
-                        "prompt": text,
-                        "multi_modal_data": {
-                            "conditionals": [cond_emb],
-                        },
-                    }
-                    for text in prepared_prompts
-                ],
+                request_items,
                 sampling_params=SamplingParams(
                     temperature=temperature,
 

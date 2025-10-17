@@ -134,6 +134,13 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         tokenizer = self.info.get_tokenizer()
+        # Ensure language tag is embedded in the prompt string (HF tokenizer __call__ won't forward custom kwargs)
+        _tk = tok_kwargs or {}
+        _lang = _tk.get("language_id", None)
+        if isinstance(_lang, str) and _lang:
+            tag = f"[{_lang.lower()}]"
+            if not prompt.startswith(tag):
+                prompt = tag + prompt
         processed_outputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
         if processed_outputs['conditionals'] is not None:
