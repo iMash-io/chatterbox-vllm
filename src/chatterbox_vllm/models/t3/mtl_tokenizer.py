@@ -235,6 +235,7 @@ class MTLTokenizer(PreTrainedTokenizer):
         mask_token: str = "[MASK]",
         **kwargs
     ):
+        print(f"[MTLTokenizer] Loading vocab file: {vocab_file}")
         self.tokenizer: Tokenizer = Tokenizer.from_file(vocab_file)
         model_dir = Path(vocab_file).parent
         self.cangjie_converter = ChineseCangjieConverter(model_dir)
@@ -287,6 +288,7 @@ class MTLTokenizer(PreTrainedTokenizer):
         if vocab_file is None:
             raise FileNotFoundError("MTLTokenizer: could not locate a tokenizer JSON (grapheme_mtl_merged_expanded_v1.json or mtl_tokenizer.json)")
 
+        print(f"[MTLTokenizer] Selected vocab file: {vocab_file}")
         return cls(vocab_file=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):
