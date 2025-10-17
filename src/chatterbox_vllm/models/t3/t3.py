@@ -631,6 +631,21 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                         out.append(final_embeds)
 
+                elif len(ids) == 1 and ids[0] == PREFILL_COND_END_TOKEN:
+                    # Edge case: a batch split produced a chunk with only the end-of-conditioning token (696).
+                    # For conditioning-only tokens, use the provided multimodal embedding slice directly
+                    # for both cond and uncond halves.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3Processor][embeds] cond-only tail ids_len=1 (token=696)")
+                    final_embeds = torch.cat([multimodal_embedding, multimodal_embedding], dim=1)
+                    out.append(final_embeds)
+                elif len(ids) == 1 and ids[0] == PREFILL_COND_START_TOKEN:
+                    # Edge case: a batch split produced a chunk with only the start-of-conditioning token (695).
+                    # Treat similarly: use provided multimodal embedding slice for both halves.
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3Processor][embeds] cond-only head ids_len=1 (token=695)")
+                    final_embeds = torch.cat([multimodal_embedding, multimodal_embedding], dim=1)
+                    out.append(final_embeds)
                 else:
                     # Something else - we don't know what to do with this.
                     print("t3/get_input_embeddings/ERROR: prefill block contains neither start nor end. Please report this issue.")
