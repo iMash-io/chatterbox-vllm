@@ -243,6 +243,15 @@ def _synthesize_one(
     Synthesize one prompt to a waveform (1, T) tensor.
     """
     tts = _ensure_engine()
+
+    # For multilingual vLLM path, ensure special tokens aren't altered by tokenizer settings.
+    extra_sampling_kwargs = {}
+    if isinstance(tts, ChatterboxMultilingualTTS):
+        extra_sampling_kwargs = {
+            "spaces_between_special_tokens": False,
+            "skip_special_tokens": False,
+        }
+
     waves = tts.generate(
         prompts=text,
         audio_prompt_path=audio_prompt_path,
@@ -251,6 +260,7 @@ def _synthesize_one(
         exaggeration=exaggeration,
         diffusion_steps=diffusion_steps,
         max_tokens=tts.max_model_len,
+        **extra_sampling_kwargs,
     )
     if not waves:
         raise RuntimeError("No audio generated")
@@ -419,11 +429,20 @@ async def _startup() -> None:
     warm_text = os.environ.get("CHATTERBOX_WARMUP_TEXT", "Hello")
     try:
         _ = _tts_engine.get_audio_conditionals(None)
+
+        warm_extra_sampling_kwargs = {}
+        if isinstance(_tts_engine, ChatterboxMultilingualTTS):
+            warm_extra_sampling_kwargs = {
+                "spaces_between_special_tokens": False,
+                "skip_special_tokens": False,
+            }
+
         _ = _tts_engine.generate(
             prompts=warm_text,
             language_id="en",
             diffusion_steps=int(os.environ.get("CHATTERBOX_WARMUP_DIFF_STEPS", "2")),
             max_tokens=min(32, _tts_engine.max_model_len),
+            **warm_extra_sampling_kwargs,
         )
     except Exception as e:
         print(f"[WARN] Warmup failed: {e}")
