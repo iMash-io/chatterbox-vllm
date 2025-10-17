@@ -73,6 +73,7 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from chatterbox_vllm.tts import ChatterboxTTS
+from chatterbox_vllm.mtl_tts import ChatterboxMultilingualTTS
 
 
 APP = FastAPI(title="OpenAI-compatible TTS for chatterbox-vllm")
@@ -241,16 +242,24 @@ def _get_engine_for_language(language_id: Optional[str]) -> ChatterboxTTS:
             return engine
 
         if _local_ckpt:
-            engine = ChatterboxTTS.from_local(
-                ckpt_dir=_local_ckpt,
-                target_device=_device,
-                variant=("english" if variant == "english" else "multilingual"),
-                s3gen_use_fp16=_s3gen_use_fp16,
-                compile=_enable_compile,
-            )
+            if variant == "multilingual":
+                engine = ChatterboxMultilingualTTS.from_local(
+                    ckpt_dir=_local_ckpt,
+                    target_device=_device,
+                    s3gen_use_fp16=_s3gen_use_fp16,
+                    compile=_enable_compile,
+                )
+            else:
+                engine = ChatterboxTTS.from_local(
+                    ckpt_dir=_local_ckpt,
+                    target_device=_device,
+                    variant="english",
+                    s3gen_use_fp16=_s3gen_use_fp16,
+                    compile=_enable_compile,
+                )
         else:
             if variant == "multilingual":
-                engine = ChatterboxTTS.from_pretrained_multilingual(
+                engine = ChatterboxMultilingualTTS.from_pretrained(
                     target_device=_device,
                     s3gen_use_fp16=_s3gen_use_fp16,
                     compile=_enable_compile,
