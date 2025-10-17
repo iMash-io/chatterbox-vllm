@@ -455,11 +455,19 @@ class ChatterboxMultilingualTTS:
             # Clamp sampling for multilingual stability when language_id is specified
             temp_use = temperature
             top_p_use = top_p
+            rep_use = repetition_penalty
+            top_k_use = int(os.environ.get("CHATTERBOX_TOP_K", "0"))  # 0=disabled
             if any(language_ids):
                 temp_use = min(temperature, 0.5)
                 top_p_use = min(top_p, 0.5)
+                # Slightly stronger repetition penalty for multilingual to reduce rambling
+                rep_use = max(repetition_penalty, 2.2)
+                # Default to a modest top-k for stability if not provided
+                if top_k_use == 0:
+                    top_k_use = 40
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
+                    print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}, "
+                          f"repetition_penalty={rep_use}, top_k={top_k_use}")
 
             # Prepare stop token for logging
             stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
@@ -475,7 +483,8 @@ class ChatterboxMultilingualTTS:
                     stop_token_ids=[stop_offset_id],
                     max_tokens=min(max_tokens, self.max_model_len),
                     top_p=top_p_use,
-                    repetition_penalty=repetition_penalty,
+                    top_k=top_k_use,
+                    repetition_penalty=rep_use,
 
                     *args, **kwargs,
                 )
@@ -565,6 +574,13 @@ class ChatterboxMultilingualTTS:
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    # Hard cap on speech token length as a final guard (env-tunable)
+                    max_speech_cap = int(os.environ.get("CHATTERBOX_MAX_SPEECH_TOKENS", "0"))
+                    if max_speech_cap > 0 and len(speech_tokens) > max_speech_cap:
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            print(f"[Tail][cap] truncating speech tokens from {len(speech_tokens)} to {max_speech_cap}")
+                        speech_tokens = speech_tokens[:max_speech_cap]
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,
