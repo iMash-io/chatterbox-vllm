@@ -130,7 +130,7 @@ class ChatterboxMultilingualTTS:
         t3_config = T3Config.multilingual()
 
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / "t3_23lang.safetensors")
+        t3_weights = load_file(ckpt_dir / "t3_mtl23ls_v2.safetensors")
 
         t3_enc = T3CondEnc(t3_config)
         t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
@@ -196,9 +196,9 @@ class ChatterboxMultilingualTTS:
                 revision=revision,
                 allow_patterns=[
                     "ve.pt", 
-                    "t3_23lang.safetensors", 
+                    "t3_mtl23ls_v2.safetensors", 
                     "s3gen.pt", 
-                    "mtl_tokenizer.json", 
+                    "grapheme_mtl_merged_expanded_v1.json", 
                     "conds.pt", 
                     "Cangjie5_TC.json"
                 ],
@@ -206,8 +206,8 @@ class ChatterboxMultilingualTTS:
             )
         )
         
-        # Ensure the symlink in './t3-multilingual-model/model.safetensors' points to t3_23lang.safetensors
-        t3_cfg_path = ckpt_dir / "t3_23lang.safetensors"
+        # Ensure the symlink in './t3-multilingual-model/model.safetensors' points to t3_mtl23ls_v2.safetensors
+        t3_cfg_path = ckpt_dir / "t3_mtl23ls_v2.safetensors"
         model_dir = Path.cwd() / "t3-multilingual-model"
         model_dir.mkdir(parents=True, exist_ok=True)
         
@@ -219,7 +219,7 @@ class ChatterboxMultilingualTTS:
         import shutil
         import json
         
-        shutil.copy(ckpt_dir / "mtl_tokenizer.json", model_dir / "mtl_tokenizer.json")
+        shutil.copy(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json", model_dir / "grapheme_mtl_merged_expanded_v1.json")
         if (ckpt_dir / "Cangjie5_TC.json").exists():
             shutil.copy(ckpt_dir / "Cangjie5_TC.json", model_dir / "Cangjie5_TC.json")
         
