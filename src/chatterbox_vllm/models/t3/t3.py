@@ -46,7 +46,7 @@ CONDITIONING_SIZE = 34 # 1 for speaker_emb, 0 for clap_emb, 32 for cond_prompt_s
 # normal speech tokens. This way, any token < SPEECH_TOKEN_OFFSET is a prefill token, and any token
 # >= SPEECH_TOKEN_OFFSET is a decode token. This will only affect the logits and the encoding logic.
 # No effect on the hidden states or the actual Llama model itself.
-SPEECH_TOKEN_OFFSET = 2500
+SPEECH_TOKEN_OFFSET = 1000
 
 
 class T3ProcessingInfo(BaseProcessingInfo):
@@ -267,13 +267,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # Initialize LLaMA backbone
         self.tfmr = LlamaModel(vllm_config=vllm_config, prefix=prefix + ".tfmr")
 
-        text_tokens_dict_size = 704 if self.cfg.tokenizer == "EnTokenizer" else 2352
-
         # Initialize custom components
-        self.t3conf = T3Config()
+        is_multilingual = getattr(self.cfg.hf_config, 'is_multilingual', False)
+
+        self.t3conf = T3Config.multilingual() if is_multilingual else T3Config()
         self.dim = self.t3conf.n_channels
         self.cond_enc = T3CondEnc(self.t3conf)
-        self.text_emb = nn.Embedding(text_tokens_dict_size, self.dim)
+        self.text_emb = nn.Embedding(self.t3conf.text_tokens_dict_size, self.dim)
         self.speech_emb = nn.Embedding(self.t3conf.speech_tokens_dict_size, self.dim)
 
         # custom position embedding
@@ -284,7 +284,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.speech_pos_emb = LearnedPositionEmbeddings(max_mel_seq_len, self.dim)
 
         # logit projection
-        # self.text_head = nn.Linear(self.dim, text_tokens_dict_size, bias=False)
+        # self.text_head = nn.Linear(self.dim, self.t3conf.text_tokens_dict_size, bias=False)
         self.speech_head = ParallelLMHead(
             num_embeddings=self.t3conf.speech_tokens_dict_size,
             embedding_dim=self.dim,
@@ -429,13 +429,6 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
             # Remember to undo the offset we applied to the speech tokens.
-
-            # if torch.min(input_ids) < SPEECH_TOKEN_OFFSET:
-            #     print("input_ids", input_ids)
-            #     print("torch.min(input_ids)", torch.min(input_ids))
-            #     print("SPEECH_TOKEN_OFFSET", SPEECH_TOKEN_OFFSET)
-            #     raise ValueError("input_ids is less than SPEECH_TOKEN_OFFSET")
-
             embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
 
             out = torch.cat([embeds, embeds], dim=1)
@@ -587,28 +580,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        # print("t3/compute_logits/hidden_states", hidden_states.shape, hidden_states.dtype)
-        # print("t3/compute_logits/sampling_metadata", sampling_metadata)
-
         # Split the hidden state vector into the three parts
         cond_hidden_states, uncond_hidden_states = hidden_states.split([self.dim, self.dim], dim=1)
-        # print("t3/compute_logits/normal_hidden_states", normal_hidden_states.shape, normal_hidden_states.dtype)
-        # print("t3/compute_logits/cfg_hidden_states", cfg_hidden_states.shape, cfg_hidden_states.dtype)
-
+    
         cond_logits = self.logits_processor(self.speech_head, cond_hidden_states, sampling_metadata)
         uncond_logits = self.logits_processor(self.speech_head, uncond_hidden_states, sampling_metadata)
-
+    
         logits = cond_logits + self.cfg_scale * (cond_logits - uncond_logits)
-
-        # print("t3/compute_logits/logit with the highest probability (cond, uncond, post-cfg):", cond_logits.argmax(), uncond_logits.argmax(), logits.argmax())
-
+    
         # HACK: Offset the logits so the resulting speech token is +SPEECH_TOKEN_OFFSET from the normal speech tokens.
-        #       We'll do this by adding SPEECH_TOKEN_OFFSET fake dimensions to the left of the logits.
-        #       This is a hack to help us unbatch batched inputs.
-        logits = torch.cat([
-            torch.zeros(logits.shape[0], SPEECH_TOKEN_OFFSET).to(logits.device).fill_(float('-inf')),
-            logits,
-        ], dim=1)
+        # Use -inf instead of zeros to ensure these padding tokens can never be selected
+        padding = torch.full((logits.shape[0], SPEECH_TOKEN_OFFSET), float('-inf'), 
+                             dtype=logits.dtype, device=logits.device)
+        logits = torch.cat([padding, logits], dim=1)
         return logits
 
 
@@ -620,7 +604,6 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         inputs_embeds: Optional[torch.Tensor] = None,  # The actual inputs to the model
         **kwargs: object,
     ) -> torch.Tensor:
-        # print("t3 ###")
         # print("t3/inputs_embeds", inputs_embeds.shape, inputs_embeds.dtype)
         # print("t3/positions", positions.shape, positions.dtype)
 
@@ -634,8 +617,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         # Split the inputs_embeds into the three parts
         cond_embeds, uncond_embeds = inputs_embeds.split([self.dim, self.dim], dim=1)
-        # print("t3/cond_embeds", cond_embeds.shape, cond_embeds.dtype)
-        # print("t3/uncond_embeds", uncond_embeds.shape, uncond_embeds.dtype)
+        # print("t3/embeds", embeds.shape, embeds.dtype)
+        # print("t3/cfg_embeds", cfg_embeds.shape, cfg_embeds.dtype)
 
         # TODO: Apply speech positional embeddings here
 
