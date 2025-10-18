@@ -168,13 +168,19 @@ class ChatterboxMultilingualTTS:
             "max_model_len": max_model_len,
         }
 
+        # Optional: prefer FlashAttention 2 in vLLM if available
+        if os.environ.get("CHATTERBOX_FA2", "0").lower() in ("1","true","yes","on"):
+            os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTENTION_2")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print("[T3] Requesting FLASH_ATTENTION_2 backend via env")
+
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
         ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", weights_only=True))
         ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
+        s3gen = S3Gen(use_fp16=s3gen_use_fp16, use_compile=compile)
         s3gen.load_state_dict(torch.load(ckpt_dir / "s3gen.pt", weights_only=True), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
@@ -659,7 +665,10 @@ class ChatterboxMultilingualTTS:
                         except Exception:
                             pass
 
-                    results.append(wav.cpu())
+                    if os.environ.get("CHATTERBOX_KEEP_ON_DEVICE", "0").lower() in ("1","true","yes","on"):
+                        results.append(wav)
+                    else:
+                        results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                 print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")

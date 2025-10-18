@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -50,7 +51,7 @@ class S3Token2Mel(torch.nn.Module):
 
     TODO: make these modules configurable?
     """
-    def __init__(self, use_fp16: bool = False):
+    def __init__(self, use_fp16: bool = False, use_compile: bool = False):
         super().__init__()
         self.tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
         self.mel_extractor = mel_spectrogram # TODO: make it a torch module?
@@ -106,6 +107,16 @@ class S3Token2Mel(torch.nn.Module):
         )
 
         self.resamplers = {}
+
+        # Optional compile of hot path for speed (guarded; shapes may be dynamic)
+        if use_compile:
+            try:
+                self.flow.inference = torch.compile(self.flow.inference, mode="max-autotune", fullgraph=False)  # type: ignore
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print("[S3Gen] torch.compile enabled for flow.inference")
+            except Exception as _e:
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[S3Gen] compile(flow.inference) failed: {_e}")
 
     @property
     def device(self):
@@ -231,8 +242,8 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self, use_fp16: bool = False):
-        super().__init__(use_fp16=use_fp16)
+    def __init__(self, use_fp16: bool = False, use_compile: bool = False):
+        super().__init__(use_fp16=use_fp16, use_compile=use_compile)
 
         f0_predictor = ConvRNNF0Predictor()
         self.mel2wav = HiFTGenerator(
@@ -249,6 +260,16 @@ class S3Token2Wav(S3Token2Mel):
         trim_fade = torch.zeros(2 * n_trim)
         trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
+
+        # Optional compile of HiFiNet hot path
+        if use_compile:
+            try:
+                self.mel2wav.inference = torch.compile(self.mel2wav.inference, mode="max-autotune", fullgraph=False)  # type: ignore
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print("[S3Gen] torch.compile enabled for mel2wav.inference")
+            except Exception as _e:
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[S3Gen] compile(mel2wav.inference) failed: {_e}")
 
     def forward(
         self,

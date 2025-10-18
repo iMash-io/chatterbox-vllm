@@ -428,6 +428,20 @@ async def _startup() -> None:
     _local_ckpt = os.environ.get("CHATTERBOX_USE_LOCAL_CKPT", "").strip() or None
     _enable_compile = os.environ.get("CHATTERBOX_COMPILE", "0").strip().lower() in ("1","true","yes","on")
 
+    # Low-level perf toggles (safe defaults)
+    try:
+        if torch.cuda.is_available():
+            # Enable TF32 on Ampere+ by default (can be disabled via env)
+            if os.environ.get("CHATTERBOX_TF32", "1").lower() in ("1","true","yes","on"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
+            # Enable cuDNN autotune (benchmark) by default
+            if os.environ.get("CHATTERBOX_CUDNN_BENCHMARK", "1").lower() in ("1","true","yes","on"):
+                torch.backends.cudnn.benchmark = True
+    except Exception as _e:
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"[INIT] perf toggles setup failed: {_e}")
+
     # Load the selected engine (single instance)
     try:
         if _local_ckpt:
