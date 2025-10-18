@@ -114,6 +114,9 @@ class SpeechRequest(BaseModel):
     holdback_ms: Optional[int] = Field(default=40, ge=0, le=120, description="Do not emit the latest N ms yet; avoids boundary re-synthesis artifacts")
     flush_ms: Optional[int] = Field(default=80, ge=10, le=500, description="Target additional audio duration to flush each progressive render")
     align_safety_ms: Optional[int] = Field(default=0, ge=0, le=40, description="Extra alignment safety on top of token→time mapping")
+    first_window_tokens: Optional[int] = Field(default=None, ge=1, le=512, description="Tokens to include in the very first render window (fallback: env CHATTERBOX_FIRST_WINDOW_TOKENS or derived from flush_ms)")
+    stream_window_tokens: Optional[int] = Field(default=None, ge=1, le=512, description="Tokens to add on subsequent progressive renders (fallback: env CHATTERBOX_STREAM_WINDOW_TOKENS or derived from flush_ms)")
+    stream_overlap_tokens: Optional[int] = Field(default=0, ge=0, le=128, description="Token overlap between successive renders; advance = stream_window_tokens - overlap (fallback: env CHATTERBOX_STREAM_OVERLAP_TOKENS)")
 
 
 # ---------- Utilities ----------
@@ -325,6 +328,9 @@ async def _synthesize_streaming_pcm_frames(
     holdback_ms: int = 40,
     flush_ms: int = 80,
     align_safety_ms: int = 0,
+    first_window_tokens: Optional[int] = None,
+    stream_window_tokens: Optional[int] = None,
+    stream_overlap_tokens: Optional[int] = None,
 ) -> Generator[bytes, None, None]:
     """
     Progressive streaming with stability frontier (language/model agnostic):
@@ -377,7 +383,19 @@ async def _synthesize_streaming_pcm_frames(
     def tokens_to_samples(n_tok: int) -> int:
         return int(round(n_tok * samples_per_token))
 
+    # Token window sizing (env overrides supported) for continuous progressive streaming.
+    # We incrementally extend the rendered prefix to keep audio flowing until completion.
     step_tokens = max(1, int(round(S3_TOKEN_RATE * (flush_ms / 1000.0))))
+    env_first = int(os.environ.get("CHATTERBOX_FIRST_WINDOW_TOKENS", "0") or "0")
+    env_stream = int(os.environ.get("CHATTERBOX_STREAM_WINDOW_TOKENS", "0") or "0")
+    env_overlap = int(os.environ.get("CHATTERBOX_STREAM_OVERLAP_TOKENS", "0") or "0")
+
+    first_tokens = first_window_tokens if (first_window_tokens and first_window_tokens > 0) else (env_first if env_first > 0 else max(step_tokens, 24))
+    stream_tokens = stream_window_tokens if (stream_window_tokens and stream_window_tokens > 0) else (env_stream if env_stream > 0 else step_tokens)
+    overlap_tokens = stream_overlap_tokens if (stream_overlap_tokens is not None) else env_overlap
+    overlap_tokens = max(0, int(overlap_tokens))
+    advance_tokens = max(1, int(stream_tokens) - overlap_tokens)
+
     holdback_samples = max(0, int(round(sr * (holdback_ms / 1000.0))))
     align_safety = max(0, int(round(sr * (align_safety_ms / 1000.0))))
 
@@ -394,18 +412,19 @@ async def _synthesize_streaming_pcm_frames(
         )
         return wav
 
-    # 2-3) Progressive renders
-    cur_tokens = step_tokens
+    # Progressive loop: keep extending the prefix and streaming the newly stable region.
+    cur_tokens = first_tokens
     first_done = False
     while True:
         cur_tokens = min(cur_tokens, total_tokens)
         steps_use = (first_chunk_diff_steps if (not first_done and first_chunk_diff_steps is not None) else diffusion_steps)
+
         wav: torch.Tensor = await asyncio.to_thread(_render_prefix, cur_tokens, steps_use)
 
         # Alignment cap by expected samples from token count (+ optional safety)
         cap = min(wav.shape[1], tokens_to_samples(cur_tokens) + align_safety)
 
-        # Stability frontier: don't emit last holdback on non-final passes
+        # Stability frontier: on non-final passes do not emit the latest holdback region
         if cur_tokens < total_tokens:
             safe_cut = max(0, cap - holdback_samples)
         else:
@@ -423,10 +442,11 @@ async def _synthesize_streaming_pcm_frames(
         first_done = True
         if cur_tokens >= total_tokens:
             break
-        cur_tokens += step_tokens
 
-    # 4) Final flush done. Apply optional watermark no-op semantics by contract
-    # (the streamed PCM was already original wav slices).
+        # advance window (may overlap for better stability if configured)
+        cur_tokens += advance_tokens
+
+    # Done
     await asyncio.sleep(0)
 
 
@@ -536,8 +556,11 @@ async def create_speech(req: SpeechRequest):
     if req.stream:
         stream_headers = {
             "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate, no-transform",
             "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive",
+            "Accept-Ranges": "none",
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
@@ -556,6 +579,9 @@ async def create_speech(req: SpeechRequest):
                 holdback_ms=req.holdback_ms or 40,
                 flush_ms=req.flush_ms or 80,
                 align_safety_ms=req.align_safety_ms or 0,
+                first_window_tokens=req.first_window_tokens,
+                stream_window_tokens=req.stream_window_tokens,
+                stream_overlap_tokens=req.stream_overlap_tokens,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,
