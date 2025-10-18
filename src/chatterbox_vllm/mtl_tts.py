@@ -434,6 +434,18 @@ class ChatterboxMultilingualTTS:
 
         with torch.inference_mode():
             start_time = time.time()
+
+            # Tail handling configuration (env-tunable)
+            tail_crop_k = int(os.environ.get("CHATTERBOX_TAIL_CROP_TOKENS", "2"))
+            tail_trim_on = os.environ.get("CHATTERBOX_TAIL_TRIM", "1").lower() in ("1","true","yes","on")
+            tail_trim_db = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB", "-42"))
+            tail_trim_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_SAFETY_MS", "50"))
+            rms_window_ms = int(os.environ.get("CHATTERBOX_RMS_WINDOW_MS", "50"))
+            rms_hop_ms = int(os.environ.get("CHATTERBOX_RMS_HOP_MS", "20"))
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[Tail] cfg: crop_k={tail_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
+                      f"safety_ms={tail_trim_safety_ms}, win_ms={rms_window_ms}, hop_ms={rms_hop_ms}")
+
             # Clamp sampling for multilingual stability when language_id is specified
             temp_use = temperature
             top_p_use = top_p
@@ -443,12 +455,18 @@ class ChatterboxMultilingualTTS:
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
 
+            # Prepare stop token for logging
+            stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
+                      f"max_tokens={min(max_tokens, self.max_model_len)}, stop_token_ids={[stop_offset_id]}")
+
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
                     temperature=temp_use,
 
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                    stop_token_ids=[stop_offset_id],
                     max_tokens=min(max_tokens, self.max_model_len),
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
@@ -476,9 +494,32 @@ class ChatterboxMultilingualTTS:
                     # Truncate at the first emitted stop-of-speech token if present
                     stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
                     tok_ids = list(output.token_ids)
+
+                    # Debug: summarize EOS behavior
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        finish_reason = getattr(output, "finish_reason", None)
+                        stop_positions = [idx for idx, t in enumerate(tok_ids) if t == stop_offset_id]
+                        head = tok_ids[:10]
+                        tail = tok_ids[-10:]
+                        print(f"[T3][eos] finish_reason={finish_reason}, out_len={len(tok_ids)}, "
+                              f"stop_found={len(stop_positions)>0}, first_stop_idx={stop_positions[0] if stop_positions else None}, "
+                              f"head={head}, tail={tail}")
+
                     if stop_offset_id in tok_ids:
                         stop_idx = tok_ids.index(stop_offset_id)
-                        tok_ids = tok_ids[:stop_idx]
+                        # Optional token-tail crop: drop K tokens immediately before EOS to avoid artifacts
+                        new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            removed = len(tok_ids) - new_end
+                            tail_preview = tok_ids[max(0, new_end-10):new_end]
+                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
+                                  f"crop_k={tail_crop_k}, new_end={new_end}, removed={removed}, tail_before_crop={tail_preview}")
+                        tok_ids = tok_ids[:new_end]
+                    else:
+                        # If no EOS, note whether we hit max_tokens
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            hit_max = len(tok_ids) >= min(max_tokens, self.max_model_len)
+                            print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
                     # Map back to base speech token space
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
@@ -489,6 +530,36 @@ class ChatterboxMultilingualTTS:
                         ref_dict=s3gen_ref,
                         n_timesteps=diffusion_steps,
                     )
+
+                    # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
+                    if tail_trim_on and wav is not None and wav.numel() > 0:
+                        sr = self.sr
+                        dur_before_ms = (wav.shape[1] * 1000.0) / sr
+                        frame_len = max(1, int(sr * rms_window_ms / 1000))
+                        hop_len = max(1, int(sr * rms_hop_ms / 1000))
+                        if wav.shape[1] >= frame_len:
+                            x2 = (wav.unsqueeze(0) ** 2)  # (1, 1, T) after conv1d reshape below
+                            x2 = x2 if x2.ndim == 3 else x2.view(1, 1, -1)
+                            kernel = torch.ones(1, 1, frame_len, device=wav.device, dtype=wav.dtype) / frame_len
+                            rms = torch.sqrt(torch.nn.functional.conv1d(x2, kernel, stride=hop_len)).squeeze()
+                            thr = 10.0 ** (tail_trim_db / 20.0)
+                            active = torch.where(rms > thr)[0]
+                            if active.numel() > 0:
+                                last_active = int(active[-1].item())
+                                safety = int(sr * tail_trim_safety_ms / 1000)
+                                cut = min(wav.shape[1], (last_active + 1) * hop_len + safety)
+                                if cut < wav.shape[1]:
+                                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                        dur_after_ms = (cut * 1000.0) / sr
+                                        print(f"[Tail][rms] trim: win={frame_len} hop={hop_len} thr={thr:.6f} "
+                                              f"last_active_frame={last_active} safety={safety} "
+                                              f"dur_before_ms={dur_before_ms:.1f} -> dur_after_ms={dur_after_ms:.1f} "
+                                              f"cut_samples={wav.shape[1]-cut}")
+                                    wav = wav[:, :cut]
+                        else:
+                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                print(f"[Tail][rms] skip: wav too short for frame_len={frame_len} (len={wav.shape[1]})")
+
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
