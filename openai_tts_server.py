@@ -19,11 +19,9 @@ OpenAI-compatible TTS HTTP server for chatterbox-vllm with ultra-low-latency str
     }
 
 - Streaming semantics:
-  When stream=true, this server now synthesizes the entire utterance in one pass with vLLM+decoder/vocoder
-  and streams small PCM frames (20–40ms) as they become available. This avoids any manual text chunking
-  or “first-chunk” special-casing, letting vLLM manage internal batching/scheduling and eliminating
-  artifacts at artificial chunk boundaries. Optionally, a small primer_silence_ms can be emitted first
-  to flush HTTP headers for very low apparent TTFA.
+  When stream=true, this server streams audio as soon as the first chunk is generated to minimize TTFA.
+  It uses sentence/phrase chunking and synthesizes each chunk independently, streaming small PCM frames
+  (20–40ms) as they become available. This avoids modifying core chatterbox code while achieving low TTFA.
 
 - Warm startup:
   On server startup, the TTS engine is loaded and a tiny placeholder synthesis is executed to warm
@@ -108,9 +106,9 @@ class SpeechRequest(BaseModel):
     audio_prompt_path: Optional[str] = Field(default=None, description="Reference audio path for timbre/voice embedding")
     watermark: Optional[str] = Field(default="off", pattern="^(on|off)$", description="If 'off', no watermarking step is applied")
     primer_silence_ms: Optional[int] = Field(default=0, ge=0, le=200, description="If >0, yield this ms of silence immediately to flush headers")
-    first_chunk_diff_steps: Optional[int] = Field(default=3, ge=1, description="Deprecated: ignored in unified streaming mode")
-    first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Deprecated: ignored in unified streaming mode")
-    chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Deprecated: ignored in unified streaming mode")
+    first_chunk_diff_steps: Optional[int] = Field(default=10, ge=1, description="Diffusion steps for the first chunk only")
+    first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
+    chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
 
 
@@ -196,6 +194,116 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
             final_chunks.append(cur)
 
     return [i for i in final_chunks if i]
+
+
+def _repair_chunk_boundaries(chunks: List[str]) -> List[str]:
+    """
+    Repair chunk boundaries for better prosody:
+      - Ensure no chunk starts with punctuation; attach any leading punctuation to the previous chunk.
+      - Trim whitespace introduced by boundary moves.
+      - Drop chunks that become empty after stripping.
+    This keeps punctuation attached to the preceding phrase (natural pause), which usually sounds best.
+    """
+    if not chunks:
+        return chunks
+
+    import re
+    # Common ASCII and Unicode punctuation to consider at boundaries
+    leading_punct = re.compile(r'^[\s\.,!\?\;:\-\u2014\u2013\u2026\)\]\}]+')
+
+    repaired: List[str] = []
+    for idx, c in enumerate(chunks):
+        c = c if isinstance(c, str) else str(c)
+        if idx == 0:
+            repaired.append(c.strip())
+            continue
+
+        # Move any leading punctuation to the previous chunk
+        m = leading_punct.match(c)
+        if m:
+            lead = m.group(0)
+            body = c[len(lead):].lstrip()
+            # Attach punctuation to previous chunk if non-empty after strip
+            if lead and lead.strip():
+                repaired[-1] = (repaired[-1].rstrip() + lead).rstrip()
+            c = body
+
+        # Normalize and append
+        c = c.strip()
+        if c:
+            repaired.append(c)
+
+    # Remove any empties that may remain
+    repaired = [c for c in repaired if c]
+    return repaired
+
+
+def _avoid_weak_endings(chunks: List[str]) -> List[str]:
+    """
+    Adjust chunk boundaries to avoid ending a chunk on weak function words, which
+    often sounds unnatural at joins (e.g., trailing 'a', 'the', 'to').
+    Strategy:
+      - If a chunk (except the last) ends with a weak word, move that last word
+        to the beginning of the next chunk so it binds with the following content.
+      - Preserves punctuation attachment rules from _repair_chunk_boundaries.
+    """
+    if not chunks:
+        return chunks
+
+    WEAK_END_WORDS = {
+        "a", "an", "the", "to", "of", "in", "on", "at", "and", "or", "but", "for", "nor", "so"
+    }
+
+    out: List[str] = chunks[:]
+    i = 0
+    while i < len(out) - 1:
+        cur = out[i].strip()
+        nxt = out[i + 1].strip()
+        if not cur or not nxt:
+            i += 1
+            continue
+
+        # Extract last word from current chunk (ignore trailing punctuation/spaces)
+        import re
+        # Remove trailing punctuation for word test (keep original text for reassignment)
+        cur_no_trail_punct = re.sub(r"[\s\.,!\?\;:\-\u2014\u2013\u2026\)\]\}]+$", "", cur)
+        words = cur_no_trail_punct.split()
+        if len(words) == 0:
+            i += 1
+            continue
+
+        last_word = words[-1].lower()
+        if last_word in WEAK_END_WORDS:
+            # Remove the last word from current chunk text safely
+            # Find index of the last_word occurrence at end (case-insensitive)
+            idx = cur_no_trail_punct.rfind(words[-1])
+            if idx >= 0:
+                new_cur = cur_no_trail_punct[:idx].rstrip()
+                # Preserve any original trailing punctuation that followed the word
+                trailing = cur[len(cur_no_trail_punct):]
+                if new_cur:
+                    out[i] = (new_cur + trailing).rstrip()
+                else:
+                    # If current becomes empty, attach trailing punct to next chunk
+                    out[i] = ""
+                    nxt = (trailing + " " + nxt).strip()
+
+                # Move the weak last_word to the start of next chunk
+                out[i + 1] = (words[-1] + " " + nxt).strip()
+
+                # If current became empty, drop it and continue without skipping the next
+                if out[i] == "":
+                    del out[i]
+                    # after deletion, do not increment i to re-check new boundary
+                    continue
+
+                # Re-check this boundary in case multiple weak tokens accumulate
+                continue
+        i += 1
+
+    # Clean empties
+    out = [c for c in out if c and c.strip()]
+    return out
 
 
 def _frame_chunk_bytes(pcm_bytes: bytes, sr: int, frame_ms: int = 40) -> Iterable[bytes]:
@@ -316,21 +424,40 @@ async def _synthesize_streaming_pcm_frames(
     audio_prompt_path: Optional[str],
     watermark: str,
     primer_silence_ms: int = 0,
-    first_chunk_diff_steps: Optional[int] = None,  # deprecated, ignored
-    first_chunk_chars: int = 60,                   # deprecated, ignored
-    chunk_chars: int = 120,                        # deprecated, ignored
+    first_chunk_diff_steps: Optional[int] = None,
+    first_chunk_chars: int = 60,
+    chunk_chars: int = 120,
     frame_ms: int = 20,
 ) -> Generator[bytes, None, None]:
     """
-    Unified streaming generator (English + Multilingual):
-      - Optionally yield a brief primer silence to flush headers quickly.
-      - Synthesize the full utterance in one pass with vLLM+decoder/vocoder.
-      - Convert to PCM16 and yield small frames immediately.
-    This removes manual text chunking and any special first-chunk handling to avoid
-    artifacts at artificial boundaries; vLLM manages internal batching and scheduling.
+    Streaming generator:
+      - Split text into chunks (~sentences/phrases)
+      - Synthesize first chunk quickly (optional reduced diffusion steps)
+      - Convert to PCM16 and yield small frames immediately
+      - Continue with subsequent chunks (full quality)
     """
     tts = _ensure_engine()
     sr = tts.sr
+
+    # For multilingual engine, avoid per-chunk prefill to prevent tokenizer/block mismatch.
+    # Generate full utterance once, then stream PCM frames.
+    if isinstance(tts, ChatterboxMultilingualTTS):
+        wav: torch.Tensor = await asyncio.to_thread(
+            _synthesize_one,
+            text,
+            language_id=language_id,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            diffusion_steps=diffusion_steps,
+            audio_prompt_path=audio_prompt_path,
+        )
+        wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
+        pcm_bytes = _float32_to_pcm16_bytes(wav)
+        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
+            if not frame:
+                continue
+            yield frame
+        return
 
     # Optional primer silence to flush headers immediately and force chunked streaming
     if primer_silence_ms and primer_silence_ms > 0:
@@ -341,26 +468,62 @@ async def _synthesize_streaming_pcm_frames(
             # Hint the event loop to flush headers and first bytes immediately
             await asyncio.sleep(0)
 
-    # Heavy compute dispatched to a thread to avoid blocking the event loop
-    wav: torch.Tensor = await asyncio.to_thread(
-        _synthesize_one,
-        text,
-        language_id=language_id,
-        temperature=temperature,
-        exaggeration=exaggeration,
-        diffusion_steps=diffusion_steps,
-        audio_prompt_path=audio_prompt_path,
-    )
+    # Build chunks: small first chunk, larger subsequent chunks
+    chunks: List[str] = []
+    if first_chunk_chars and first_chunk_chars > 0:
+        fchunks = _split_text_for_low_latency(text, max_chars=first_chunk_chars)
+        if fchunks:
+            first_text = fchunks[0]
+            chunks.append(first_text)
+            remaining = text[len(first_text):].strip()
+            if remaining:
+                chunks.extend(_split_text_for_low_latency(remaining, max_chars=chunk_chars))
+    else:
+        chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
 
-    # Watermark policy (off = no modification)
-    wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
+    # Repair chunk boundaries to avoid starting chunks with punctuation for better prosody
+    chunks = _repair_chunk_boundaries(chunks)
+    # Avoid weak function-word endings at boundaries for better continuity
+    chunks = _avoid_weak_endings(chunks)
 
-    # To PCM16 and then to frames
-    pcm_bytes = _float32_to_pcm16_bytes(wav)
-    for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-        if not frame:
-            continue
-        yield frame
+    if not chunks:
+        return
+
+    for idx, chunk in enumerate(chunks):
+        # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
+        steps = diffusion_steps
+        if idx == 0 and first_chunk_diff_steps is not None:
+            steps = max(1, int(first_chunk_diff_steps))
+
+        # Heavy compute dispatched to thread to not block event loop
+        wav: torch.Tensor = await asyncio.to_thread(
+            _synthesize_one,
+            chunk,
+            language_id=language_id,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            diffusion_steps=steps,
+            audio_prompt_path=audio_prompt_path,
+        )
+
+        # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
+        fade_ms = 5
+        fade_samples = int(sr * fade_ms / 1000)
+        if wav.numel() > fade_samples and fade_samples > 0:
+            tail = wav[:, -fade_samples:]
+            ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
+            tail_faded = tail * ramp
+            wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
+
+        # Watermark policy (off = no modification)
+        wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
+
+        # To PCM16 and then to 40ms-ish frames
+        pcm_bytes = _float32_to_pcm16_bytes(wav)
+        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
+            if not frame:
+                continue
+            yield frame
 
 
 # ---------- FastAPI lifecycle ----------
@@ -482,7 +645,7 @@ async def create_speech(req: SpeechRequest):
                 audio_prompt_path=req.audio_prompt_path,
                 watermark=req.watermark or "off",
                 primer_silence_ms=req.primer_silence_ms or 0,
-                first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
+                first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 10),
                 first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
