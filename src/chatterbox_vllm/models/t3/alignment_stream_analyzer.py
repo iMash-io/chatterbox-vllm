@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import os
 
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,11 @@ class AlignmentStreamAnalyzer:
         for k, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
             self.last_aligned_attns += [None]
             self._add_attention_spy(tfmr, k, layer_idx, head_idx)
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            try:
+                print(f"[Align][init] slice={self.text_tokens_slice} eos_idx={self.eos_idx} hooks={len(LLAMA_ALIGNED_HEADS)} fallback={'on' if self.text_embeds_norm is not None else 'off'}")
+            except Exception:
+                pass
 
     def _add_attention_spy(self, tfmr, buffer_idx: int, layer_idx: int, head_idx: int):
         """
@@ -133,6 +139,11 @@ class AlignmentStreamAnalyzer:
         try:
             # Gather averaged attention for the selected heads
             aligned_avail = [a for a in self.last_aligned_attns if a is not None]
+            if (os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")):
+                try:
+                    print(f"[Align][step] frame={self.curr_frame_pos} avail_heads={len(aligned_avail)}")
+                except Exception:
+                    pass
             if not aligned_avail:
                 # Fallback: estimate alignment via cosine similarity to prefill text embeddings if available
                 if (self.text_embeds_norm is not None) and (hidden_state is not None):
@@ -144,6 +155,11 @@ class AlignmentStreamAnalyzer:
                         sims = torch.matmul(self.text_embeds_norm, h.unsqueeze(-1)).squeeze(-1)  # (S,)
                         cur_text_posn = int(torch.argmax(sims).item())
                         S = int(self.text_embeds_norm.shape[0])
+                        if (os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")):
+                            try:
+                                print(f"[Align][fallback] pos={cur_text_posn}/{S-1} started={self.started} complete={self.complete} tail_frames={self.tail_frames}")
+                            except Exception:
+                                pass
                         # Update position/complete tracking
                         discontinuity = not (-4 < cur_text_posn - self.text_position < 7)
                         if not discontinuity:
@@ -197,6 +213,11 @@ class AlignmentStreamAnalyzer:
             if A.numel() > 0:
                 cur_text_posn = int(A_chunk[-1].argmax().item())
                 discontinuity = not (-4 < cur_text_posn - self.text_position < 7)  # lenient
+                if (os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")):
+                    try:
+                        print(f"[Align][attn] pos={cur_text_posn}/{S-1} started={self.started} complete={self.complete}")
+                    except Exception:
+                        pass
                 if not discontinuity:
                     self.text_position = cur_text_posn
             else:
