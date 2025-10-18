@@ -415,6 +415,22 @@ class ChatterboxMultilingualTTS:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
+        # Compute debug flag and sampling params early so prompt window analysis uses final temperature
+        dbg = os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")
+        temp_use = float(temperature)
+        top_p_use = float(top_p)
+        if any(language_ids):
+            temp_use = min(temp_use, 0.5)
+            top_p_use = min(top_p_use, 0.5)
+            if dbg:
+                print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
+        # Optional deterministic decoding to remove cross-run variability
+        if os.environ.get("CHATTERBOX_DETERMINISTIC", "0").lower() in ("1","true","yes","on"):
+            temp_use = 0.0
+            top_p_use = 1.0
+            if dbg:
+                print(f"[T3] Deterministic mode: forcing temperature={temp_use}, top_p={top_p_use}")
+
         # Norm and prepare text; pass language_id via tokenization kwargs to tokenizer
         request_items = []
         prompt_windows = []
@@ -460,25 +476,12 @@ class ChatterboxMultilingualTTS:
             tail_trim_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_SAFETY_MS", "50"))
             rms_window_ms = int(os.environ.get("CHATTERBOX_RMS_WINDOW_MS", "50"))
             rms_hop_ms = int(os.environ.get("CHATTERBOX_RMS_HOP_MS", "20"))
-            dbg = os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")
+            # dbg computed earlier
             if dbg:
                 print(f"[Tail] cfg: crop_k={tail_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
                       f"safety_ms={tail_trim_safety_ms}, win_ms={rms_window_ms}, hop_ms={rms_hop_ms}")
 
-            # Clamp sampling for multilingual stability when language_id is specified
-            temp_use = temperature
-            top_p_use = top_p
-            if any(language_ids):
-                temp_use = min(temperature, 0.5)
-                top_p_use = min(top_p, 0.5)
-                if dbg:
-                    print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
-            # Optional deterministic decoding to remove cross-run variability
-            if os.environ.get("CHATTERBOX_DETERMINISTIC", "0").lower() in ("1","true","yes","on"):
-                temp_use = 0.0
-                top_p_use = 1.0
-                if dbg:
-                    print(f"[T3] Deterministic mode: forcing temperature={temp_use}, top_p={top_p_use}")
+            # temp_use and top_p_use were computed earlier based on language_ids and environment
 
             # Prepare stop token for logging
             stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
