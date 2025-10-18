@@ -552,7 +552,7 @@ async def _synthesize_streaming_pcm_frames(
 
             # Crossfade the overlapping region
             head = cur[:, :overlap]
-            xfade = _crossfade(prev_tail, head, ms=crossfade_ms if overlap == hold_samples else int(1000 * overlap / sr))
+            xfade = _crossfade(prev_tail, head, ms=crossfade_ms if overlap == hold_samples else int(1000 * overlap / sr), sr=sr)
             if xfade is not None and xfade.numel() > 0:
                 pcm_bytes = _float32_to_pcm16_bytes(xfade)
                 for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
