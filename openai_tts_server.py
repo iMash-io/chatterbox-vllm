@@ -527,6 +527,12 @@ async def create_speech(req: SpeechRequest):
     fmt = (req.response_format or req.format or "wav")
     if fmt == "pcm":
         fmt = "pcm16"
+    # Log branch selection to diagnose streaming vs non-streaming behavior
+    try:
+        print(f"[API] /v1/audio/speech stream={bool(req.stream)} fmt={fmt} lang={req.language_id} "
+              f"frame_ms={req.frame_ms} primer_silence_ms={req.primer_silence_ms} diff_steps={req.diffusion_steps}")
+    except Exception:
+        pass
 
     # Streaming path: regardless of requested format, stream linear PCM for lowest latency
     if req.stream:
@@ -535,6 +541,10 @@ async def create_speech(req: SpeechRequest):
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
+        try:
+            print("[API] Using STREAMING path (StreamingResponse, chunked)")
+        except Exception:
+            pass
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
                 req.input,
@@ -556,6 +566,10 @@ async def create_speech(req: SpeechRequest):
 
     # Non-streaming path: synthesize full audio then return as a single response
     try:
+        try:
+            print("[API] Using NON-STREAM path (single Response; Content-Length will be set)")
+        except Exception:
+            pass
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
             req.input,

@@ -89,7 +89,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--url",
-        default="https://97yesgvn9neq5y-8888.proxy.runpod.net/v1/audio/speech",
+        default="http://192.168.0.164:8000/v1/audio/speech",
         help="TTS endpoint URL",
     )
     p.add_argument("--model", default="gpt-4o-mini-tts", help="Model name")
@@ -144,7 +144,7 @@ def main():
         "voice": args.voice,
         "input": args.input,
         "response_format": args.response_format,  # "pcm" | "wav" | "mp3"
-        "stream": True,
+        "stream": False,
         "language_id": args.language_id,
         "watermark": args.watermark,
         "diffusion_steps": args.diffusion_steps,
@@ -317,3 +317,8 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+
+
