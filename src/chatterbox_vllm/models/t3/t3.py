@@ -205,11 +205,13 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             except Exception as _e:
                 print(f"[T3Processor][apply] prompt_ids debug error: {_e}")
 
-        # Sanitize: remove any LLaMA EOS tokens (id=2) that can break prefill parsing
+        # Sanitize: optionally remove LLaMA EOS tokens (id=2) if explicitly enabled.
+        # For custom tokenizers (EnTokenizer/MTLTokenizer), id==2 can be a valid token; stripping it corrupts text.
         try:
+            strip_eos = os.environ.get("CHATTERBOX_STRIP_LLM_EOS", "0").lower() in ("1","true","yes","on")
             if isinstance(prompt_ids, torch.Tensor):
                 prompt_ids = prompt_ids.tolist()
-            if isinstance(prompt_ids, list):
+            if strip_eos and isinstance(prompt_ids, list):
                 before_len = len(prompt_ids)
                 prompt_ids = [pid for pid in prompt_ids if pid != 2]
                 after_len = len(prompt_ids)
@@ -433,10 +435,12 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
             buffer = []
 
         for input_id in input_ids:
-            # Skip stray EOS (id=2) tokens in prefill stream; not part of T3 prefill markers
+            # Optionally skip LLaMA EOS (id=2) only if explicitly enabled via env.
+            # Default is to keep id=2 since our custom tokenizer may legitimately produce it.
             try:
-                if int(input_id) == 2:
-                    continue
+                if os.environ.get("CHATTERBOX_STRIP_LLM_EOS", "0").lower() in ("1","true","yes","on"):
+                    if int(input_id) == 2:
+                        continue
             except Exception:
                 pass
 
