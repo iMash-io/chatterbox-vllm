@@ -17,7 +17,9 @@
     "tail_abs_thresh": 0.0018,
     "tail_min_sil_ms": 240,
     "tail_crop_tokens": 0,
-    "head_trim_safety_ms": 80
+    "head_trim_safety_ms": 80,
+    "tokens_per_char": 2.0,
+    "pre_guard_margin": 48
   },
   "ar": {
     "align_safety_ms": 20,
