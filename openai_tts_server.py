@@ -145,13 +145,14 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
     """
     Split text into sentence/phrase-like chunks for low-latency streaming.
     Preference: split on natural punctuation boundaries; fallback to fixed width.
+    Supports CJK and Arabic punctuation for better multilingual chunking.
     """
     text = text.strip()
     if not text:
         return []
-    # First split by strong punctuation
+    # First split by strong punctuation (ASCII + common CJK/Arabic)
     import re
-    parts = re.split(r"([\.!\?;:])", text)
+    parts = re.split(r"([\.!\?;:。！？；，、،؛؟…])", text)
     # Re-join punctuation tokens
     assembled: List[str] = []
     cur = ""
@@ -163,32 +164,52 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
         chunk = (seg + punc).strip()
         if not chunk:
             continue
-        if len(cur) + 1 + len(chunk) <= max_chars:
-            cur = (cur + " " + chunk).strip() if cur else chunk
+        if cur and len(cur) + 1 + len(chunk) <= max_chars:
+            cur = (cur + " " + chunk).strip()
+        elif not cur and len(chunk) <= max_chars:
+            cur = chunk
         else:
             if cur:
                 assembled.append(cur)
             cur = chunk
+            # If a single segment is already larger than max_chars (e.g., no spaces),
+            # keep it as-is for now; it will be split in the next pass.
     if cur:
         assembled.append(cur)
 
     if not assembled:
         return [text]
 
-    # If we ended with a very long chunk, split by whitespace to max_chars
+    # Second pass: enforce max_chars with whitespace when available, else fixed-width slicing.
     final_chunks: List[str] = []
     for c in assembled:
         if len(c) <= max_chars:
             final_chunks.append(c)
             continue
+
         words = c.split()
+        if len(words) <= 1:
+            # No whitespace -> fixed width slicing
+            for i in range(0, len(c), max_chars):
+                final_chunks.append(c[i:i + max_chars])
+            continue
+
         cur = ""
         for w in words:
-            if len(cur) + 1 + len(w) <= max_chars:
-                cur = (cur + " " + w).strip() if cur else w
-            else:
+            if len(w) > max_chars:
+                # Extremely long token (e.g., CJK run with no spaces); flush cur and slice w
                 if cur:
                     final_chunks.append(cur)
+                    cur = ""
+                for i in range(0, len(w), max_chars):
+                    final_chunks.append(w[i:i + max_chars])
+                continue
+            if not cur:
+                cur = w
+            elif len(cur) + 1 + len(w) <= max_chars:
+                cur = f"{cur} {w}"
+            else:
+                final_chunks.append(cur)
                 cur = w
         if cur:
             final_chunks.append(cur)
@@ -209,7 +230,7 @@ def _repair_chunk_boundaries(chunks: List[str]) -> List[str]:
 
     import re
     # Common ASCII and Unicode punctuation to consider at boundaries
-    leading_punct = re.compile(r'^[\s\.,!\?\;:\-\u2014\u2013\u2026\)\]\}]+')
+    leading_punct = re.compile(r'^[\s\.,!\?\;:\-\u2014\u2013\u2026\)\]\}\u3002\uFF01\uFF1F\u3001\uFF0C\u060C\u061B\u061F]+')
 
     repaired: List[str] = []
     for idx, c in enumerate(chunks):
@@ -439,25 +460,6 @@ async def _synthesize_streaming_pcm_frames(
     tts = _ensure_engine()
     sr = tts.sr
 
-    # For multilingual engine, avoid per-chunk prefill to prevent tokenizer/block mismatch.
-    # Generate full utterance once, then stream PCM frames.
-    if isinstance(tts, ChatterboxMultilingualTTS):
-        wav: torch.Tensor = await asyncio.to_thread(
-            _synthesize_one,
-            text,
-            language_id=language_id,
-            temperature=temperature,
-            exaggeration=exaggeration,
-            diffusion_steps=diffusion_steps,
-            audio_prompt_path=audio_prompt_path,
-        )
-        wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
-        pcm_bytes = _float32_to_pcm16_bytes(wav)
-        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-            if not frame:
-                continue
-            yield frame
-        return
 
     # Optional primer silence to flush headers immediately and force chunked streaming
     if primer_silence_ms and primer_silence_ms > 0:
