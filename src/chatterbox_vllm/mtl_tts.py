@@ -513,7 +513,7 @@ class ChatterboxMultilingualTTS:
                 default_tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
                 default_tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
                 default_guard = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
-                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "48"))
+                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "32"))
 
                 # Language-specific overrides (good defaults for multilingual)
                 def lang_val(lang: str, key: str, fallback: str):
