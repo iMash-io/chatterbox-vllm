@@ -3,7 +3,7 @@ name = "chatterbox-vllm"
 description = "Chatterbox TTS ported to VLLM for efficienct and advanced inference tasks"
 dynamic = ["version"]
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
 authors = [
     {name = "David Li", email = "david@david-li.com"},
