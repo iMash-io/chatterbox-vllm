@@ -405,40 +405,16 @@ class ChatterboxTTS:
                       f"max_tokens={pre_cap_tokens}, stop_token_ids={[stop_offset_id]}")
 
             start_time = time.time()
-            # Dynamic control of EOS handling in vLLM:
-            # - If CHATTERBOX_VLLM_USE_STOP_TOKEN is enabled, let vLLM stop on EOS.
-            # - Otherwise, disable EOS stopping (ignore_eos=True) and handle early/late EOS ourselves.
-            use_vllm_stop = os.environ.get("CHATTERBOX_VLLM_USE_STOP_TOKEN", "0").lower() in ("1", "true", "yes", "on")
-            eos_bias_str = os.environ.get("CHATTERBOX_EOS_LOGIT_BIAS", None)
-            logit_bias = None
-            if eos_bias_str is not None and str(eos_bias_str).strip() != "":
-                try:
-                    logit_bias = {int(stop_offset_id): float(eos_bias_str)}
-                except Exception:
-                    logit_bias = None
-
-            if use_vllm_stop:
-                sampling_params = SamplingParams(
+            batch_results = self.t3.generate(
+                request_items,
+                sampling_params=SamplingParams(
                     temperature=temp_use,
                     stop_token_ids=[stop_offset_id],
                     max_tokens=pre_cap_tokens,
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
-                    logit_bias=logit_bias,
+                    *args, **kwargs,
                 )
-            else:
-                sampling_params = SamplingParams(
-                    temperature=temp_use,
-                    ignore_eos=True,
-                    max_tokens=pre_cap_tokens,
-                    top_p=top_p_use,
-                    repetition_penalty=repetition_penalty,
-                    logit_bias=logit_bias,
-                )
-
-            batch_results = self.t3.generate(
-                request_items,
-                sampling_params=sampling_params
             )
             t3_gen_time = time.time() - start_time
             print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
@@ -468,66 +444,20 @@ class ChatterboxTTS:
                               f"stop_found={len(stop_positions)>0}, first_stop_idx={stop_positions[0] if stop_positions else None}, "
                               f"head={head}, tail={tail}")
 
-                    # Dynamic EOS handling:
-                    # - If EOS appears too early (before a fraction of estimated tokens), ignore it.
-                    # - Otherwise truncate at EOS (with optional tail crop).
-                    # - If no acceptable EOS, rely on guards/repetition trimming below.
-                    stop_positions = [idx for idx, t in enumerate(tok_ids) if t == stop_offset_id]
-                    if stop_positions:
-                        try:
-                            prompt_str = request_items[i].get("prompt", "")
-                            prompt_clean = re.sub(r"\[[^\]]+\]", "", prompt_str)
-                            char_len = sum(1 for c in prompt_clean if not c.isspace())
-                            tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
-                            tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                            tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
-                            est_tokens = max(tmin, min(tmax, int(math.ceil(char_len * tpc))))
-                            sup_frac = float(os.environ.get("CHATTERBOX_SUPPRESS_EOS_FRAC", "0.7"))
-                            early_min = int(os.environ.get("CHATTERBOX_EARLY_EOS_MIN", "48"))
-                            early_thresh = max(early_min, int(math.ceil(est_tokens * sup_frac)))
-                        except Exception as _e:
-                            early_thresh = 0
-                            if dbg:
-                                print(f"[T3][eos] early threshold compute failed, not suppressing early EOS: {_e}")
-
-                        valid_stops = [pos for pos in stop_positions if pos >= early_thresh]
-                        if valid_stops:
-                            stop_idx = valid_stops[0]
-                            new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
-                            if dbg:
-                                removed = len(tok_ids) - new_end
-                                tail_preview = tok_ids[max(0, new_end-10):new_end]
-                                print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
-                                      f"crop_k={tail_crop_k}, new_end={new_end}, removed={removed}, tail_before_crop={tail_preview}, "
-                                      f"early_thresh={early_thresh}")
-                            tok_ids = tok_ids[:new_end]
-                        else:
-                            if dbg:
-                                print(f"[T3][eos] early EOS suppressed (positions={stop_positions}, early_thresh={early_thresh}); not truncating here")
+                    # Truncate at first stop-of-speech; optionally crop K tokens before EOS
+                    if stop_offset_id in tok_ids:
+                        stop_idx = tok_ids.index(stop_offset_id)
+                        new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
+                        if dbg:
+                            removed = len(tok_ids) - new_end
+                            tail_preview = tok_ids[max(0, new_end-10):new_end]
+                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
+                                  f"crop_k={tail_crop_k}, new_end={new_end}, removed={removed}, tail_before_crop={tail_preview}")
+                        tok_ids = tok_ids[:new_end]
                     else:
                         if dbg:
                             hit_max = len(tok_ids) >= pre_cap_tokens
                             print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
-
-                    # Repetition-based late cutoff: if trailing run of the last token is too long, truncate it
-                    try:
-                        max_repeat = int(os.environ.get("CHATTERBOX_REPEAT_RUN_MAX", "3"))
-                        if max_repeat >= 2 and len(tok_ids) > max_repeat:
-                            last_tok = tok_ids[-1]
-                            run_len = 1
-                            for j2 in range(len(tok_ids) - 2, -1, -1):
-                                if tok_ids[j2] == last_tok:
-                                    run_len += 1
-                                else:
-                                    break
-                            if run_len >= max_repeat:
-                                cut = len(tok_ids) - run_len
-                                if dbg:
-                                    print(f"[T3][rep] truncating repetition run: token={last_tok}, run_len={run_len}, cut={cut}")
-                                tok_ids = tok_ids[:cut]
-                    except Exception as _e:
-                        if dbg:
-                            print(f"[T3][rep] repetition trim skipped: {_e}")
 
                     # Map to base speech token space and drop invalids
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
