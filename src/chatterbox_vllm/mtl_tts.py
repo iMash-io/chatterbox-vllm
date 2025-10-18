@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
 import os
+import re
+import math
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -455,6 +457,12 @@ class ChatterboxMultilingualTTS:
                 top_p_use = min(top_p, 0.5)
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
+            # Optional deterministic decoding to remove cross-run variability
+            if os.environ.get("CHATTERBOX_DETERMINISTIC", "0").lower() in ("1","true","yes","on"):
+                temp_use = 0.0
+                top_p_use = 1.0
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[T3] Deterministic mode: forcing temperature={temp_use}, top_p={top_p_use}")
 
             # Prepare stop token for logging
             stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
@@ -525,6 +533,30 @@ class ChatterboxMultilingualTTS:
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    # Dynamic overrun guard based on normalized prompt length (language-agnostic)
+                    try:
+                        prompt_str = request_items[i].get("prompt", "")
+                        # Strip [lang], [START], [STOP], etc.
+                        prompt_clean = re.sub(r"\[[^\]]+\]", "", prompt_str)
+                        # Remove whitespace for character count
+                        char_len = sum(1 for c in prompt_clean if not c.isspace())
+                        tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                        tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                        tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                        guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                        est_tokens = int(math.ceil(char_len * tpc))
+                        est_tokens = max(tmin, min(tmax, est_tokens))
+                        guard_cap = int(math.ceil(est_tokens * guard_mult))
+                        n_tokens_cur = int(speech_tokens.shape[0]) if speech_tokens.ndim == 1 else int(speech_tokens.shape[1])
+                        if n_tokens_cur > guard_cap:
+                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                print(f"[Guard] char_len={char_len} est={est_tokens} guard={guard_cap} n_tokens={n_tokens_cur} -> cap to {guard_cap}")
+                            # speech_tokens is 1D by construction after drop; keep slicing safe
+                            speech_tokens = speech_tokens[:guard_cap]
+                    except Exception as _e:
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            print(f"[Guard] skipped due to error: {_e}")
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,
