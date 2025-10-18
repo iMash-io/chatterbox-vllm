@@ -52,11 +52,6 @@ Environment Variables:
   - CHATTERBOX_USE_LOCAL_CKPT: path to local checkpoint dir (else uses HF from_pretrained)
   - CHATTERBOX_WARMUP_TEXT: text to use for warmup (default: "Hello")
   - CHATTERBOX_WARMUP_DIFF_STEPS: int diffusion steps for warmup (default: 2)
-  - CHATTERBOX_STREAM_CROSSFADE_MS: crossfade length in ms for stitching between streamed chunks (default: 60)
-  - CHATTERBOX_STREAM_LEADING_TRIM_MS: leading trim in ms removed from the head of each subsequent chunk (default: 80)
-  - CHATTERBOX_STREAM_CONTEXT_WORDS: number of trailing words from the previous chunk to prepend as context to the next chunk (default: 3)
-  - CHATTERBOX_STREAM_TOKEN_RATE: estimated S3 token rate (tokens/sec) for mapping text length to time (default: 25)
-  - CHATTERBOX_STREAM_VOWEL_TRIM_MS: extra leading trim (ms) when next chunk begins with a vowel onset (default: 20)
 """
 
 import os
@@ -198,74 +193,7 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
         if cur:
             final_chunks.append(cur)
 
-    # Post-pass: avoid splitting after weak function words; merge across boundaries dynamically
-    cleaned = [i for i in final_chunks if i]
-    try:
-        NONBREAK_END_WORDS = {
-            "a","an","the","to","of","in","on","for","and","or","but",
-            "my","your","our","their","his","her","its"
-        }
-        def _ends_with_nonbreaker(s: str) -> bool:
-            if not s: return False
-            # strip trailing punctuation/quotes/dashes
-            t = s.rstrip().rstrip("”’'\"—-) ")
-            # Allow merge even if strong punctuation was appended by normalization.
-            # Inspect the last lexical token without trailing punctuation.
-            t_no_punc = t.rstrip(".!?;:")
-            words = t_no_punc.split()
-            return len(words) > 0 and words[-1].lower().strip("“’'\"(") in NONBREAK_END_WORDS
-
-        def _starts_with_word(s: str) -> bool:
-            import re
-            if not s: return False
-            return re.match(r"^[A-Za-z]", s.strip()) is not None
-
-        merged: List[str] = []
-        i = 0
-        while i < len(cleaned):
-            cur_chunk = cleaned[i]
-            if i < len(cleaned) - 1 and _ends_with_nonbreaker(cur_chunk) and _starts_with_word(cleaned[i+1]):
-                next_chunk = cleaned[i+1]
-                next_words = next_chunk.split()
-                moved = 0
-                # Drop trailing strong punctuation on the left chunk so we don't mid-sentence terminate.
-                cur_chunk = cur_chunk.rstrip().rstrip(".!?;:")
-                # Try to attach up to 2 words if it fits max_chars
-                while next_words and moved < 2:
-                    candidate = (cur_chunk + " " + next_words[0]).strip()
-                    if len(candidate) <= max_chars:
-                        cur_chunk = candidate
-                        next_words.pop(0)
-                        moved += 1
-                    else:
-                        break
-                # If we could not attach any word due to max_chars, move the dangling non-breaker to the next chunk
-                if moved == 0:
-                    cur_words = cur_chunk.split()
-                    if cur_words:
-                        nb = cur_words[-1]
-                        # Only move if it is indeed a non-breaker (extra safety)
-                        if nb.lower() in NONBREAK_END_WORDS:
-                            cur_chunk = " ".join(cur_words[:-1]).strip()
-                            cleaned[i+1] = (nb + " " + " ".join(next_words).strip()).strip()
-                        else:
-                            cleaned[i+1] = " ".join(next_words).strip()
-                    else:
-                        cleaned[i+1] = " ".join(next_words).strip()
-                else:
-                    cleaned[i+1] = " ".join(next_words).strip()
-                # If we consumed all of the next chunk, skip it
-                if cleaned[i+1] == "":
-                    i += 1
-            merged.append(cur_chunk)
-            i += 1
-        # Remove any emptied chunks
-        cleaned = [c for c in merged if c]
-    except Exception:
-        # On any error, fall back to original chunks
-        pass
-
-    return cleaned
+    return [i for i in final_chunks if i]
 
 
 def _frame_chunk_bytes(pcm_bytes: bytes, sr: int, frame_ms: int = 40) -> Iterable[bytes]:
@@ -289,68 +217,6 @@ def _apply_watermark_if_needed(wav: torch.Tensor, sr: int, watermark: str) -> to
     # If you ever need a watermark, implement here (e.g., inaudible pseudo-random sequence).
     # Keeping it a strict no-op to honor "off" removing watermark entirely.
     return wav
-
-
-# ---------- Streaming smoothing helpers ----------
-
-def _trim_head_ms(wav: torch.Tensor, ms: int, sr: int) -> torch.Tensor:
-    """
-    Remove the first ms of audio to eliminate vocoder onset artifacts at chunk boundaries.
-    """
-    if wav is None or not torch.is_tensor(wav) or wav.numel() == 0 or ms <= 0:
-        return wav
-    n = int(sr * ms / 1000)
-    if n <= 0:
-        return wav
-    if wav.shape[1] <= n:
-        return wav[:, 0:0]
-    return wav[:, n:]
-
-
-def _take_tail_ms(wav: torch.Tensor, ms: int, sr: int) -> torch.Tensor:
-    """
-    Return the last ms of audio (for overlap-add with the next chunk).
-    """
-    if wav is None or not torch.is_tensor(wav) or wav.numel() == 0 or ms <= 0:
-        # Preserve shape semantics
-        return wav[:, 0:0] if (wav is not None and wav.ndim == 2) else torch.zeros(1, 0)
-    n = int(sr * ms / 1000)
-    n = max(0, min(n, wav.shape[1]))
-    return wav[:, -n:]
-
-
-def _crossfade(a_tail: torch.Tensor, b_head: torch.Tensor, ms: int, sr: int) -> torch.Tensor:
-    """
-    Overlap-add crossfade between the tail of chunk A and the head of chunk B.
-    If one side is shorter than requested ms, use the min available length.
-    """
-    if (a_tail is None or a_tail.numel() == 0) and (b_head is None or b_head.numel() == 0):
-        return torch.zeros(1, 0)
-    L_req = int(sr * ms / 1000)
-    La = a_tail.shape[1] if (a_tail is not None and a_tail.ndim == 2) else 0
-    Lb = b_head.shape[1] if (b_head is not None and b_head.ndim == 2) else 0
-    use = max(0, min(L_req, La, Lb))
-    if use <= 0:
-        if a_tail is not None and a_tail.numel() > 0:
-            return torch.cat([a_tail, b_head], dim=1) if (b_head is not None and b_head.numel() > 0) else a_tail
-        return b_head
-    a = a_tail[:, -use:]
-    b = b_head[:, :use]
-    # Remove DC components and match RMS of b to a to reduce timbre/energy jump
-    eps = 1e-8
-    a_mean = a.mean(dim=1, keepdim=True)
-    b_mean = b.mean(dim=1, keepdim=True)
-    a0 = a - a_mean
-    b0 = b - b_mean
-    a_rms = torch.sqrt(torch.clamp((a0 ** 2).mean(dim=1, keepdim=True), min=eps))
-    b_rms = torch.sqrt(torch.clamp((b0 ** 2).mean(dim=1, keepdim=True), min=eps))
-    scale = torch.clamp(a_rms / b_rms, 0.5, 2.0)  # avoid extreme jumps
-    b0 = b0 * scale
-    # Equal-power crossfade (perceptually smoother)
-    t = torch.linspace(0.0, math.pi / 2.0, steps=use, dtype=a.dtype, device=a.device).unsqueeze(0)
-    wa = torch.cos(t) ** 2  # weight for a
-    wb = torch.sin(t) ** 2  # weight for b
-    return a0 * wa + b0 * wb
 
 
 # ---------- Core synthesis helpers ----------
@@ -508,36 +374,16 @@ async def _synthesize_streaming_pcm_frames(
     if not chunks:
         return
 
-    # Dynamic audio stitching knobs
-    crossfade_ms = int(os.environ.get("CHATTERBOX_STREAM_CROSSFADE_MS", "60"))
-    leading_trim_ms = int(os.environ.get("CHATTERBOX_STREAM_LEADING_TRIM_MS", "80"))
-    context_words = int(os.environ.get("CHATTERBOX_STREAM_CONTEXT_WORDS", "3"))
-    token_rate = float(os.environ.get("CHATTERBOX_STREAM_TOKEN_RATE", "25"))
-    tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
-    vowel_trim_ms = int(os.environ.get("CHATTERBOX_STREAM_VOWEL_TRIM_MS", "20"))
-    hold_ms = max(0, crossfade_ms)
-    hold_samples = int(sr * hold_ms / 1000)
-
-    prev_tail: Optional[torch.Tensor] = None
-
     for idx, chunk in enumerate(chunks):
         # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
         steps = diffusion_steps
         if idx == 0 and first_chunk_diff_steps is not None:
             steps = max(1, int(first_chunk_diff_steps))
 
-        # Prepare context-prepended synthesis text (improves prosody continuity)
-        context_str = ""
-        if idx > 0 and context_words > 0:
-            prev_words = chunks[idx - 1].split()
-            ctx_words = prev_words[-context_words:] if len(prev_words) >= context_words else prev_words
-            context_str = " ".join(ctx_words).strip()
-        synth_text = (context_str + " " + chunk).strip() if context_str else chunk
-
         # Heavy compute dispatched to thread to not block event loop
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
-            synth_text,
+            chunk,
             language_id=language_id,
             temperature=temperature,
             exaggeration=exaggeration,
@@ -545,129 +391,20 @@ async def _synthesize_streaming_pcm_frames(
             audio_prompt_path=audio_prompt_path,
         )
 
-        # Optional minimal tail fade to avoid clicks (kept conservative; crossfade handles main smoothing)
+        # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
         fade_ms = 5
         fade_samples = int(sr * fade_ms / 1000)
         if wav.numel() > fade_samples and fade_samples > 0:
             tail = wav[:, -fade_samples:]
             ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
-            wav = torch.cat([wav[:, :-fade_samples], tail * ramp], dim=1)
+            tail_faded = tail * ramp
+            wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
 
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
 
-        if idx == 0:
-            # Stream immediately except for the held tail for crossfade
-            if hold_samples > 0 and wav.shape[1] > hold_samples:
-                immediate = wav[:, :-hold_samples]
-                prev_tail = wav[:, -hold_samples:]
-                if immediate.numel() > 0:
-                    pcm_bytes = _float32_to_pcm16_bytes(immediate)
-                    for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                        if not frame:
-                            continue
-                        yield frame
-            else:
-                # Chunk too short to hold a tail; stream all and skip crossfade
-                pcm_bytes = _float32_to_pcm16_bytes(wav)
-                for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                    if not frame:
-                        continue
-                    yield frame
-                prev_tail = None
-            continue
-
-        # Subsequent chunks: trim head to remove vocoder onset artifacts and skip context audio, then crossfade
-        trim_ms = leading_trim_ms
-        if context_str:
-            # Estimate time for the prepended context using char length -> tokens -> time mapping
-            ctx_chars = sum(1 for c in context_str if not c.isspace())
-            try:
-                ctx_ms_est = int(round(1000.0 * ((ctx_chars * tpc) / max(1e-6, token_rate))))
-                trim_ms = max(trim_ms, ctx_ms_est)
-            except Exception:
-                pass
-        # Add extra trim when the chunk begins with a vowel (onset artifacts are more audible on vowels)
-        try:
-            import re
-            m = re.search(r"[A-Za-z]", chunk)
-            if m:
-                first_alpha = chunk[m.start()].lower()
-                if first_alpha in "aeiou":
-                    trim_ms = max(trim_ms, leading_trim_ms + vowel_trim_ms)
-        except Exception:
-            pass
-        cur = _trim_head_ms(wav, trim_ms, sr)
-
-        if prev_tail is not None and prev_tail.numel() > 0 and cur is not None and cur.numel() > 0:
-            # Determine overlap length actually available
-            overlap = min(hold_samples, prev_tail.shape[1], cur.shape[1])
-
-            # If prev_tail is longer than cur head, flush the extra non-overlapped part first
-            if prev_tail.shape[1] > overlap:
-                leftover = prev_tail[:, :prev_tail.shape[1] - overlap]
-                if leftover.numel() > 0:
-                    pcm_bytes = _float32_to_pcm16_bytes(leftover)
-                    for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                        if not frame:
-                            continue
-                        yield frame
-
-            # Crossfade the overlapping region
-            head = cur[:, :overlap]
-            xfade = _crossfade(prev_tail, head, ms=int(1000 * overlap / sr), sr=sr)
-            if xfade is not None and xfade.numel() > 0:
-                pcm_bytes = _float32_to_pcm16_bytes(xfade)
-                for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                    if not frame:
-                        continue
-                    yield frame
-
-            # Stream the mid-body, holding back the last hold_samples for the next boundary
-            start_mid = overlap
-            if cur.shape[1] > start_mid + hold_samples:
-                mid = cur[:, start_mid:cur.shape[1] - hold_samples]
-                if mid.numel() > 0:
-                    pcm_bytes = _float32_to_pcm16_bytes(mid)
-                    for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                        if not frame:
-                            continue
-                        yield frame
-                prev_tail = cur[:, -hold_samples:]
-            else:
-                # Not enough to hold a full tail for next time; keep whatever remains as next tail
-                prev_tail = cur[:, max(start_mid, cur.shape[1] - hold_samples):]
-        else:
-            # No valid overlap possible. Flush previous tail (if any), then stream current normally.
-            if prev_tail is not None and prev_tail.numel() > 0:
-                pcm_bytes = _float32_to_pcm16_bytes(prev_tail)
-                for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                    if not frame:
-                        continue
-                    yield frame
-                prev_tail = None
-
-            if cur is not None and cur.numel() > 0:
-                if hold_samples > 0 and cur.shape[1] > hold_samples:
-                    body = cur[:, :-hold_samples]
-                    if body.numel() > 0:
-                        pcm_bytes = _float32_to_pcm16_bytes(body)
-                        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                            if not frame:
-                                continue
-                            yield frame
-                    prev_tail = cur[:, -hold_samples:]
-                else:
-                    pcm_bytes = _float32_to_pcm16_bytes(cur)
-                    for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                        if not frame:
-                            continue
-                        yield frame
-                    prev_tail = None
-
-    # After the final chunk, flush any held tail
-    if prev_tail is not None and prev_tail.numel() > 0:
-        pcm_bytes = _float32_to_pcm16_bytes(prev_tail)
+        # To PCM16 and then to 40ms-ish frames
+        pcm_bytes = _float32_to_pcm16_bytes(wav)
         for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
             if not frame:
                 continue
