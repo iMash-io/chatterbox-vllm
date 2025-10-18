@@ -797,15 +797,15 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
             # Run two passes to avoid sequence-doubling issues
             hs_cond = self.tfmr(
                 input_ids=None,
-                positions=positions,
+                positions=positions.contiguous(),
                 intermediate_tensors=None,
-                inputs_embeds=cond_embeds
+                inputs_embeds=cond_embeds.contiguous()
             )
             hs_uncond = self.tfmr(
                 input_ids=None,
-                positions=positions,
+                positions=positions.contiguous(),
                 intermediate_tensors=None,
-                inputs_embeds=uncond_embeds
+                inputs_embeds=uncond_embeds.contiguous()
             )
             # Concatenate along hidden dimension to form [seq_len, 2*dim]
             hidden_states = torch.cat([hs_cond, hs_uncond], dim=1)
@@ -814,9 +814,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
             # Original single-pass trick: concatenate along sequence dimension and split back
             hidden_states = self.tfmr(
                 input_ids=None,
-                positions=torch.cat([positions, positions], dim=0),
+                positions=torch.cat([positions, positions], dim=0).contiguous(),
                 intermediate_tensors=None,
-                inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0)
+                inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0).contiguous()
             )
             # Reconcatenate the hidden states into the master tensor
             hidden_state_1, hidden_state_2 = hidden_states.split([len(cond_embeds), len(uncond_embeds)], dim=0)
