@@ -511,9 +511,9 @@ class ChatterboxMultilingualTTS:
                 # Global defaults
                 default_tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
                 default_tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                default_tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                default_tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "2400"))
                 default_guard = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
-                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "32"))
+                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "64"))
 
                 # Language-specific overrides (good defaults for multilingual)
                 def lang_val(lang: str, key: str, fallback: str):
@@ -521,7 +521,7 @@ class ChatterboxMultilingualTTS:
 
                 # Reasonable per-language TPC fallbacks (can be tuned via env)
                 tpc_map_default = {
-                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_PER_CHAR", "2")),
+                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_PER_CHAR", "2.6")),
                     "ar": float(lang_val("ar", "CHATTERBOX_TOKENS_PER_CHAR", "1.45")),
                     "zh": float(lang_val("zh", "CHATTERBOX_TOKENS_PER_CHAR", "1.00")),
                     "ja": float(lang_val("ja", "CHATTERBOX_TOKENS_PER_CHAR", "1.20")),
@@ -530,7 +530,7 @@ class ChatterboxMultilingualTTS:
                     "en": float(lang_val("en", "CHATTERBOX_TOKENS_PER_CHAR", str(default_tpc))),
                 }
                 guard_map_default = {
-                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_GUARD_MULT", "1.8")),
                     "ar": float(lang_val("ar", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
                     "zh": float(lang_val("zh", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
                     "ja": float(lang_val("ja", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
@@ -718,7 +718,7 @@ class ChatterboxMultilingualTTS:
                         char_len = sum(1 for c in prompt_clean if not c.isspace())
                         tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
                         tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                        tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                        tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "2400"))
                         guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
                         est_tokens = int(math.ceil(char_len * tpc))
                         est_tokens = max(tmin, min(tmax, est_tokens))
