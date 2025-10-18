@@ -731,7 +731,7 @@ async def create_speech(req: SpeechRequest):
                 watermark=req.watermark or "off",
                 primer_silence_ms=req.primer_silence_ms or 0,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
-                first_chunk_chars=req.first_chunk_chars or 60,
+                first_chunk_chars=req.first_chunk_chars or 30,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
             ),
