@@ -556,9 +556,9 @@ class ChatterboxMultilingualTTS:
                                   f"crop_k={tail_crop_k}, new_end={new_end}, removed={removed}, tail_before_crop={tail_preview}")
                         tok_ids = tok_ids[:new_end]
                     else:
-                        # If no EOS, note whether we hit max_tokens
+                        # If no EOS, note whether we hit the pre-cap for this request (parity with english path)
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            hit_max = len(tok_ids) >= min(max_tokens, self.max_model_len)
+                            hit_max = len(tok_ids) >= pre_cap_tokens
                             print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
                     # Map back to base speech token space
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
@@ -608,6 +608,41 @@ class ChatterboxMultilingualTTS:
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                             print(f"[Align] tokens={n_tokens} expected_samples={expected_samples} safety={align_safety} cap={cap} wav_in={wav.shape[1]}")
                         wav = wav[:, :cap]
+
+                    # Energy-based head trim (RMS) to remove initial silence before speech onset
+                    head_trim_on = os.environ.get("CHATTERBOX_HEAD_TRIM", "1").lower() in ("1","true","yes","on")
+                    head_trim_safety_ms = int(os.environ.get("CHATTERBOX_HEAD_TRIM_SAFETY_MS", "50"))
+                    if head_trim_on and wav is not None and wav.numel() > 0:
+                        sr_ht = self.sr
+                        frame_len_ht = max(1, int(sr_ht * rms_window_ms / 1000))
+                        hop_len_ht = max(1, int(sr_ht * rms_hop_ms / 1000))
+                        if wav.shape[1] >= frame_len_ht:
+                            x2 = (wav.unsqueeze(0) ** 2)
+                            x2 = x2 if x2.ndim == 3 else x2.view(1, 1, -1)
+                            kernel_ht = torch.ones(1, 1, frame_len_ht, device=wav.device, dtype=wav.dtype) / frame_len_ht
+                            rms_ht = torch.sqrt(torch.nn.functional.conv1d(x2, kernel_ht, stride=hop_len_ht)).squeeze()
+                            peak_ht = float(rms_ht.max().item()) if rms_ht.numel() > 0 else 0.0
+                            if peak_ht > 0:
+                                thr_ht = peak_ht * (10.0 ** (tail_trim_db_rel / 20.0))
+                            else:
+                                thr_ht = 10.0 ** (tail_trim_db / 20.0)
+                            active_ht = torch.where(rms_ht > thr_ht)[0]
+                            if active_ht.numel() > 0:
+                                first_active = int(active_ht[0].item())
+                                safety_ht = int(sr_ht * head_trim_safety_ms / 1000)
+                                start = max(0, first_active * hop_len_ht - safety_ht)
+                                if start > 0 and start < wav.shape[1]:
+                                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                        dur_before_ms = (wav.shape[1] * 1000.0) / sr_ht
+                                        dur_after_ms = ((wav.shape[1] - start) * 1000.0) / sr_ht
+                                        print(f"[Head][rms] trim: win={frame_len_ht} hop={hop_len_ht} thr={thr_ht:.6f} "
+                                              f"first_active_frame={first_active} safety={safety_ht} "
+                                              f"dur_before_ms={dur_before_ms:.1f} -> dur_after_ms={dur_after_ms:.1f} "
+                                              f"cut_samples={start}")
+                                    wav = wav[:, start:]
+                        else:
+                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                print(f"[Head][rms] skip: wav too short for frame_len={frame_len_ht} (len={wav.shape[1]})")
 
                     # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
                     if tail_trim_on and wav is not None and wav.numel() > 0:
