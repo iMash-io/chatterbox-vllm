@@ -31,6 +31,8 @@ dependencies = [
     "russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub",
     "spacy-pkuseg",
     "pykakasi",
+    "dicta-onnx",
+    "onnxruntime"
 ]
 
 [project.optional-dependencies]
