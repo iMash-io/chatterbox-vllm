@@ -29,6 +29,7 @@ REPO_ID = "ResembleAI/chatterbox"
 _kakasi = None
 _dicta = None
 _russian_stresser = None
+_dicta_warned = False
 
 
 def is_kanji(c: str) -> bool:
@@ -83,22 +84,84 @@ def hiragana_normalize(text: str) -> str:
         return text
 
 
-def add_hebrew_diacritics(text: str) -> str:
-    """Hebrew text normalization: adds diacritics to Hebrew text."""
-    global _dicta
-    
+def _load_dicta():
+    """Lazily initialize and cache a Hebrew diacritizer.
+
+    Tries in order:
+      1) dicta_onnx.Dicta (preferred; zero-arg or DICTA_MODEL_PATH)
+      2) dicta.Dicta (requires DICTA_MODEL_PATH)
+    Respects CHATTERBOX_HE_DIACRITIZE=0 to disable. Logs only once on failure/disable.
+    """
+    global _dicta, _dicta_warned
+
+    # Allow explicit disable
+    if os.environ.get("CHATTERBOX_HE_DIACRITIZE", "1").lower() in ("0", "false", "off", "no"):
+        if not _dicta_warned:
+            logger.info("Hebrew diacritization disabled by CHATTERBOX_HE_DIACRITIZE")
+            _dicta_warned = True
+        return None
+
+    if _dicta is not None:
+        return _dicta
+
+    model_path = (os.environ.get("DICTA_MODEL_PATH", "") or "").strip() or None
+
+    # 1) Try dicta_onnx first
     try:
-        if _dicta is None:
-            from dicta_onnx import Dicta
-            _dicta = Dicta()
-        
-        return _dicta.add_diacritics(text)
-        
+        from dicta_onnx import Dicta as DictaOnnx
+        try:
+            # Prefer zero-arg; if signature needs a path, fall back to passing model_path
+            _dicta = DictaOnnx() if model_path is None else DictaOnnx(model_path)
+        except TypeError:
+            # Some builds may require a path
+            if model_path is not None:
+                _dicta = DictaOnnx(model_path)
+            else:
+                _dicta = None
+        if _dicta is not None:
+            logger.info("Hebrew diacritizer enabled (dicta_onnx)")
+            return _dicta
     except ImportError:
-        logger.warning("dicta_onnx not available - Hebrew text processing skipped")
-        return text
+        pass
     except Exception as e:
-        logger.warning(f"Hebrew diacritization failed: {e}")
+        if not _dicta_warned:
+            logger.warning(f"dicta_onnx failed to initialize: {e}")
+            _dicta_warned = True
+
+    # 2) Fallback to python 'dicta' package (requires model_path)
+    try:
+        from dicta import Dicta as DictaPy
+        if model_path is None:
+            if not _dicta_warned:
+                logger.warning("dicta package requires DICTA_MODEL_PATH; diacritization skipped")
+                _dicta_warned = True
+            return None
+        _dicta = DictaPy(model_path)
+        logger.info("Hebrew diacritizer enabled (dicta)")
+        return _dicta
+    except ImportError:
+        if not _dicta_warned:
+            logger.info("No Dicta implementation available; Hebrew diacritization skipped")
+            _dicta_warned = True
+        return None
+    except Exception as e:
+        if not _dicta_warned:
+            logger.warning(f"Hebrew diacritization not enabled: {e}")
+            _dicta_warned = True
+        return None
+
+
+def add_hebrew_diacritics(text: str) -> str:
+    """Hebrew text normalization: adds diacritics to Hebrew text (if diacritizer available)."""
+    d = _load_dicta()
+    if d is None:
+        return text
+    try:
+        return d.add_diacritics(text)
+    except Exception as e:
+        # Fail-soft without spamming logs
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            logger.warning(f"Hebrew diacritization failed at runtime: {e}")
         return text
 
 
