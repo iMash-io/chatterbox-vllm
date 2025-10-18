@@ -153,7 +153,7 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             except Exception as _e:
                 print(f"[T3Processor][_call_hf_processor] debug error: {_e}")
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
-        if processed_outputs['conditionals'] is not None:
+        if processed_outputs['conditionals'] is not None and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
             print("processed_outputs", processed_outputs['conditionals'].shape)
         return processed_outputs
 
@@ -214,9 +214,11 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
                 prompt_ids = [pid for pid in prompt_ids if pid != 2]
                 after_len = len(prompt_ids)
                 if before_len != after_len:
-                    print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
         except Exception as _e:
-            print(f"t3/apply: sanitize prompt_ids failed: {_e}")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"t3/apply: sanitize prompt_ids failed: {_e}")
 
         # We are going to apply custom logic to squish the embeddings in the right format.
         # The final embedding will look like <| cond | text | speech |>
@@ -339,7 +341,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.logits_processor = LogitsProcessor(self.t3conf.speech_tokens_dict_size)
 
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
-        print("Applying CFG scale:", self.cfg_scale)
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print("Applying CFG scale:", self.cfg_scale)
 
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -706,7 +709,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     # print("t3/get_input_embeddings/fallback: returning zero embeds for stray block")
                     return zeros
                 except Exception as _e:
-                    print(f"t3/get_input_embeddings/fallback failed: {_e}")
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"t3/get_input_embeddings/fallback failed: {_e}")
                     raise
 
             output = torch.cat(out, dim=0)

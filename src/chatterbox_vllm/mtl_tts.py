@@ -155,7 +155,8 @@ class ChatterboxMultilingualTTS:
         vllm_memory_needed = (1.55*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 128)
         vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
 
-        print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+            print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
         base_vllm_kwargs = {
             "model": "./t3-multilingual-model",
@@ -515,20 +516,22 @@ class ChatterboxMultilingualTTS:
                 )
             )
             t3_gen_time = time.time() - start_time
-            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
-            # run torch gc
-            torch.cuda.empty_cache()
+            # run torch gc (opt-in; default off to avoid CUDA sync)
+            if os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
+                torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
             for i, batch_result in enumerate(batch_results):
                 for output in batch_result.outputs:
-                    if i % 5 == 0:
+                    if i % 5 == 0 and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
-                    # Run gc every 10 prompts
-                    if i % 10 == 0:
+                    # Run gc every 10 prompts (opt-in; default off)
+                    if i % 10 == 0 and os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
                         torch.cuda.empty_cache()
 
                     # Truncate at the first emitted stop-of-speech token if present
@@ -658,7 +661,8 @@ class ChatterboxMultilingualTTS:
 
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
-            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
         

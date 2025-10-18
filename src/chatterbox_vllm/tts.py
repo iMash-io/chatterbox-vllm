@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
+import os
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -336,20 +337,22 @@ class ChatterboxTTS:
                 )
             )
             t3_gen_time = time.time() - start_time
-            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
-            # run torch gc
-            torch.cuda.empty_cache()
+            # run torch gc (opt-in; default off to avoid CUDA sync)
+            if os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
+                torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
             for i, batch_result in enumerate(batch_results):
                 for output in batch_result.outputs:
-                    if i % 5 == 0:
+                    if i % 5 == 0 and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
-                    # Run gc every 10 prompts
-                    if i % 10 == 0:
+                    # Run gc every 10 prompts (opt-in; default off)
+                    if i % 10 == 0 and os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
                         torch.cuda.empty_cache()
 
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
@@ -363,7 +366,8 @@ class ChatterboxTTS:
                     )
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
-            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
         
