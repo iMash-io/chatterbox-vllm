@@ -5,6 +5,7 @@ import time
 import os
 import re
 import math
+import unicodedata
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -472,27 +473,83 @@ class ChatterboxMultilingualTTS:
 
             # Pre-generation per-prompt token cap (converted to a single batch max_tokens)
             try:
-                tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
-                tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
-                guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                # Global defaults
+                default_tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                default_tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                default_tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                default_guard = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
                 pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "16"))
-                caps = []
+
+                # Language-specific overrides (good defaults for multilingual)
+                def lang_val(lang: str, key: str, fallback: str):
+                    return os.environ.get(f"{key}_{lang.upper()}", os.environ.get(key, fallback))
+
+                # Reasonable per-language TPC fallbacks (can be tuned via env)
+                tpc_map_default = {
+                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_PER_CHAR", "1.35")),
+                    "ar": float(lang_val("ar", "CHATTERBOX_TOKENS_PER_CHAR", "1.45")),
+                    "zh": float(lang_val("zh", "CHATTERBOX_TOKENS_PER_CHAR", "1.00")),
+                    "ja": float(lang_val("ja", "CHATTERBOX_TOKENS_PER_CHAR", "1.20")),
+                    "ko": float(lang_val("ko", "CHATTERBOX_TOKENS_PER_CHAR", "1.20")),
+                    "ru": float(lang_val("ru", "CHATTERBOX_TOKENS_PER_CHAR", "1.80")),
+                    "en": float(lang_val("en", "CHATTERBOX_TOKENS_PER_CHAR", str(default_tpc))),
+                }
+                guard_map_default = {
+                    "he": float(lang_val("he", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "ar": float(lang_val("ar", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "zh": float(lang_val("zh", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "ja": float(lang_val("ja", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "ko": float(lang_val("ko", "CHATTERBOX_TOKENS_GUARD_MULT", "1.25")),
+                    "ru": float(lang_val("ru", "CHATTERBOX_TOKENS_GUARD_MULT", "1.40")),
+                    "en": float(lang_val("en", "CHATTERBOX_TOKENS_GUARD_MULT", str(default_guard))),
+                }
+                tmin_map_default = {
+                    "he": int(lang_val("he", "CHATTERBOX_TOKENS_MIN", "48")),
+                    "ar": int(lang_val("ar", "CHATTERBOX_TOKENS_MIN", "48")),
+                    "zh": int(lang_val("zh", "CHATTERBOX_TOKENS_MIN", "40")),
+                    "ja": int(lang_val("ja", "CHATTERBOX_TOKENS_MIN", "48")),
+                    "ko": int(lang_val("ko", "CHATTERBOX_TOKENS_MIN", "48")),
+                    "ru": int(lang_val("ru", "CHATTERBOX_TOKENS_MIN", "56")),
+                    "en": int(lang_val("en", "CHATTERBOX_TOKENS_MIN", str(default_tmin))),
+                }
+
+                ests = []
+                guard_caps = []
                 for idx, it in enumerate(request_items):
                     ptxt = it.get("prompt", "")
+                    # Extract language tag from prompt if present: [he]...[START]...
+                    m = re.match(r"\[([a-z]{2})\]", ptxt.strip())
+                    lang = (m.group(1).lower() if m else None) or "en"
+
+                    # Clean prompt: drop [tags]
                     pclean = re.sub(r"\[[^\]]+\]", "", ptxt)
-                    clen = sum(1 for c in pclean if not c.isspace())
+                    # Remove whitespace
+                    pclean = "".join(ch for ch in pclean if not ch.isspace())
+                    # Remove diacritics/combining marks (e.g., Hebrew nikud)
+                    pclean = "".join(ch for ch in pclean if unicodedata.category(ch) != "Mn")
+
+                    clen = len(pclean)
+
+                    tpc = float(os.environ.get(f"CHATTERBOX_TOKENS_PER_CHAR_{lang.upper()}", tpc_map_default.get(lang, default_tpc)))
+                    guard_mult = float(os.environ.get(f"CHATTERBOX_TOKENS_GUARD_MULT_{lang.upper()}", guard_map_default.get(lang, default_guard)))
+                    tmin = int(os.environ.get(f"CHATTERBOX_TOKENS_MIN_{lang.upper()}", tmin_map_default.get(lang, default_tmin)))
+                    tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", str(default_tmax)))
+
                     est = int(math.ceil(clen * tpc))
                     est = max(tmin, min(tmax_env, est))
                     gcap = int(math.ceil(est * guard_mult))
-                    caps.append(gcap)
+                    ests.append(est)
+                    guard_caps.append(gcap)
+
                     if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[PreCap] idx={idx} char_len={clen} est={est} guard={gcap}")
-                if caps:
-                    pre_cap_tokens = max(1, min(caps) + max(0, pre_margin))
+                        print(f"[PreCap] idx={idx} lang={lang} char_len={clen} tpc={tpc} est={est} guard_mult={guard_mult} guard={gcap}")
+
+                # Use conservative pre-cap based on estimated tokens, not guard cap (guard is enforced post-hoc)
+                if ests:
+                    pre_cap_tokens = max(1, min(ests) + max(0, pre_margin))
                 else:
                     pre_cap_tokens = min(max_tokens, self.max_model_len)
-                # Respect caller cap and model cap
+
                 pre_cap_tokens = min(pre_cap_tokens, min(max_tokens, self.max_model_len))
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[PreCap] chosen_max_tokens={pre_cap_tokens} (margin={pre_margin})")
@@ -622,10 +679,9 @@ class ChatterboxMultilingualTTS:
                             kernel_ht = torch.ones(1, 1, frame_len_ht, device=wav.device, dtype=wav.dtype) / frame_len_ht
                             rms_ht = torch.sqrt(torch.nn.functional.conv1d(x2, kernel_ht, stride=hop_len_ht)).squeeze()
                             peak_ht = float(rms_ht.max().item()) if rms_ht.numel() > 0 else 0.0
-                            if peak_ht > 0:
-                                thr_ht = peak_ht * (10.0 ** (tail_trim_db_rel / 20.0))
-                            else:
-                                thr_ht = 10.0 ** (tail_trim_db / 20.0)
+                            abs_thr_ht = 10.0 ** (tail_trim_db / 20.0)
+                            rel_thr_ht = peak_ht * (10.0 ** (tail_trim_db_rel / 20.0))
+                            thr_ht = max(abs_thr_ht, rel_thr_ht)
                             active_ht = torch.where(rms_ht > thr_ht)[0]
                             if active_ht.numel() > 0:
                                 first_active = int(active_ht[0].item())
@@ -644,6 +700,21 @@ class ChatterboxMultilingualTTS:
                             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                                 print(f"[Head][rms] skip: wav too short for frame_len={frame_len_ht} (len={wav.shape[1]})")
 
+                    # Amplitude-based head trim (fallback)
+                    head_abs_on = os.environ.get("CHATTERBOX_HEAD_ABS_TRIM", "1").lower() in ("1","true","yes","on")
+                    head_abs_thr = float(os.environ.get("CHATTERBOX_HEAD_ABS_THRESH", "0.003"))
+                    if head_abs_on and wav is not None and wav.numel() > 0:
+                        wabs = torch.abs(wav.squeeze(0))
+                        nz = torch.nonzero(wabs > head_abs_thr, as_tuple=False)
+                        if nz.numel() > 0:
+                            idx0 = int(nz[0].item())
+                            safety_ht = int(self.sr * head_trim_safety_ms / 1000)
+                            start = max(0, idx0 - safety_ht)
+                            if start > 0 and start < wav.shape[1]:
+                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                    print(f"[Head][abs] trim: thr={head_abs_thr:.6f} start_idx={idx0} cut={start}")
+                                wav = wav[:, start:]
+
                     # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
                     if tail_trim_on and wav is not None and wav.numel() > 0:
                         sr = self.sr
@@ -656,10 +727,9 @@ class ChatterboxMultilingualTTS:
                             kernel = torch.ones(1, 1, frame_len, device=wav.device, dtype=wav.dtype) / frame_len
                             rms = torch.sqrt(torch.nn.functional.conv1d(x2, kernel, stride=hop_len)).squeeze()
                             peak = float(rms.max().item()) if rms.numel() > 0 else 0.0
-                            if peak > 0:
-                                thr = peak * (10.0 ** (tail_trim_db_rel / 20.0))
-                            else:
-                                thr = 10.0 ** (tail_trim_db / 20.0)
+                            abs_thr = 10.0 ** (tail_trim_db / 20.0)
+                            rel_thr = peak * (10.0 ** (tail_trim_db_rel / 20.0))
+                            thr = max(abs_thr, rel_thr)
                             active = torch.where(rms > thr)[0]
                             if active.numel() > 0:
                                 last_active = int(active[-1].item())
@@ -676,6 +746,23 @@ class ChatterboxMultilingualTTS:
                         else:
                             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                                 print(f"[Tail][rms] skip: wav too short for frame_len={frame_len} (len={wav.shape[1]})")
+
+                    # Amplitude-based tail trim (finalizer)
+                    tail_abs_on = os.environ.get("CHATTERBOX_TAIL_ABS_TRIM", "1").lower() in ("1","true","yes","on")
+                    tail_abs_thr = float(os.environ.get("CHATTERBOX_TAIL_ABS_THRESH", "0.003"))
+                    tail_min_sil_ms = int(os.environ.get("CHATTERBOX_TAIL_MIN_SIL_MS", "120"))
+                    if tail_abs_on and wav is not None and wav.numel() > 0:
+                        wabs = torch.abs(wav.squeeze(0))
+                        nz = torch.nonzero(wabs > tail_abs_thr, as_tuple=False)
+                        if nz.numel() > 0:
+                            last_idx = int(nz[-1].item())
+                            safety = int(self.sr * tail_trim_safety_ms / 1000)
+                            end = min(wav.shape[1], last_idx + safety)
+                            trailing = wav.shape[1] - end
+                            if trailing >= int(self.sr * tail_min_sil_ms / 1000):
+                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                    print(f"[Tail][abs] trim: thr={tail_abs_thr:.6f} last_idx={last_idx} end={end} cut={wav.shape[1]-end}")
+                                wav = wav[:, :end]
 
                     # Optional VAD-based end trim (fallback). Disabled by default.
                     if os.environ.get("CHATTERBOX_VAD_TRIM", "0").lower() in ("1","true","yes","on") and wav is not None and wav.numel() > 0:
