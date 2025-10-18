@@ -33,6 +33,7 @@ from vllm.sequence import IntermediateTensors
 from chatterbox_vllm.models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 from .modules.cond_enc import T3Cond, T3CondEnc
+from .alignment_stream_analyzer import AlignmentStreamAnalyzer
 
 
 PREFILL_COND_START_TOKEN = 695  # [PLACEHOLDER55]; Marks the first token of the conditionals
@@ -342,6 +343,9 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
         print("Applying CFG scale:", self.cfg_scale)
+        # Optional online alignment-driven EOS controller (initialized lazily)
+        self.alignment_stream_analyzer = None
+        self._align_text_slice = None
 
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -567,6 +571,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     final_embeds = torch.cat([cond_embeds, uncond_embeds], dim=1)
                     # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                     out.append(final_embeds)
+                    # Initialize/update alignment analyzer once full prefill (cond + full text + sos) is seen
+                    try:
+                        text_len = len(text_ids)
+                        text_slice = (CONDITIONING_SIZE, CONDITIONING_SIZE + text_len)
+                        if (self.alignment_stream_analyzer is None) or (self._align_text_slice != text_slice):
+                            self.alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                                self.tfmr,
+                                text_tokens_slice=text_slice,
+                                eos_idx=self.t3conf.stop_speech_token + SPEECH_TOKEN_OFFSET,
+                            )
+                            self._align_text_slice = text_slice
+                    except Exception:
+                        pass
                 elif ids[0] == PREFILL_COND_START_TOKEN:
                     # We have the start of the prefill block.
                     if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
@@ -621,6 +638,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         final_embeds = torch.cat([cond_embeds, uncond_embeds], dim=1)
                         # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                         out.append(final_embeds)
+                        # Initialize/update alignment analyzer when end of prefill with conditioning is observed
+                        try:
+                            text_len = len(text_ids)
+                            text_slice = (CONDITIONING_SIZE, CONDITIONING_SIZE + text_len)
+                            if (self.alignment_stream_analyzer is None) or (self._align_text_slice != text_slice):
+                                self.alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                                    self.tfmr,
+                                    text_tokens_slice=text_slice,
+                                    eos_idx=self.t3conf.stop_speech_token + SPEECH_TOKEN_OFFSET,
+                                )
+                                self._align_text_slice = text_slice
+                        except Exception:
+                            pass
                     else:
                         # We don't have the conditioning portion, and we may only have part of the text portion.
                         # print("t3/get_input_embeddings/end of prefill block, no conditioning")
@@ -736,6 +766,12 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         padding = torch.full((logits.shape[0], SPEECH_TOKEN_OFFSET), float('-inf'), 
                              dtype=logits.dtype, device=logits.device)
         logits = torch.cat([padding, logits], dim=1)
+        # Online alignment-based EOS controller (suppresses early EOS, forces EOS on long tails/repetition)
+        if hasattr(self, "alignment_stream_analyzer") and self.alignment_stream_analyzer is not None:
+            try:
+                logits = self.alignment_stream_analyzer.step(logits)
+            except Exception:
+                pass
         return logits
 
 
