@@ -24,6 +24,7 @@ from .models.voice_encoder import VoiceEncoder
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
+from .stop_logic import analyze_prompt_window, apply_dynamic_stop
 from .text_utils import punc_norm, SUPPORTED_LANGUAGES
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -187,30 +188,6 @@ class ChatterboxTTS:
         except Exception as _e:
             print(f"[TTS][WARN] Failed to copy tokenizer.json: {_e}")
 
-        # Optionally force attention weights for analyzer (tradeoff: slower than SDPA)
-        # vLLM reads config.json from the model dir. When enabled, prefer eager attention with attentions on.
-        try:
-            if os.environ.get("CHATTERBOX_ALIGN_ATTNS", "0").lower() in ("1", "true", "yes", "on"):
-                cfg_path = Path.cwd() / "t3-model" / "config.json"
-                cfg_path.parent.mkdir(parents=True, exist_ok=True)
-                cfg = {}
-                if cfg_path.exists():
-                    try:
-                        import json as _json
-                        with open(cfg_path, "r") as f:
-                            cfg = _json.load(f)
-                    except Exception:
-                        cfg = {}
-                # Update/insert keys
-                cfg["attn_implementation"] = "eager"
-                cfg["output_attentions"] = True
-                # Write back
-                import json as _json
-                with open(cfg_path, "w") as f:
-                    _json.dump(cfg, f, indent=2)
-                print("[EN] Forcing attn_implementation=eager with output_attentions=True for alignment analyzer")
-        except Exception as _e:
-            print(f"[EN][WARN] Failed to patch t3-model/config.json for attentions: {_e}")
         return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
 
     @classmethod
@@ -358,7 +335,7 @@ class ChatterboxTTS:
 
         with torch.inference_mode():
             # Tail handling and debug configuration (env-tunable; mirroring multilingual path)
-            tail_crop_k = 0
+            tail_crop_k = int(os.environ.get("CHATTERBOX_TAIL_CROP_TOKENS", "2"))
             tail_trim_on = os.environ.get("CHATTERBOX_TAIL_TRIM", "1").lower() in ("1","true","yes","on")
             tail_trim_db = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB", "-42"))
             tail_trim_db_rel = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB_REL", "-35"))
@@ -385,33 +362,52 @@ class ChatterboxTTS:
                 if dbg:
                     print(f"[T3] Deterministic mode: forcing temperature={temp_use}, top_p={top_p_use}")
 
-            # Prepare request_items and pre-cap tokens by estimated prompt length
+            # Prepare request items and analyze prompt lengths for dynamic EOS
             request_items = []
-            for p in prompts:
+            prompt_windows = []
+            for idx, p in enumerate(prompts):
                 request_items.append({
                     "prompt": p,
-                    "multi_modal_data": { "conditionals": [cond_emb] },
+                    "multi_modal_data": {"conditionals": [cond_emb]},
                 })
+                window = analyze_prompt_window(
+                    p,
+                    temperature=temp_use,
+                    max_model_len=self.max_model_len,
+                    max_tokens_limit=max_tokens,
+                )
+                prompt_windows.append(window)
+                if dbg:
+                    print(
+                        f"[PreCap] idx={idx} est={window.estimated_tokens} min={window.min_tokens} "
+                        f"guard={window.guard_tokens} cap={window.model_cap}"
+                    )
 
-            pre_cap_tokens = min(max_tokens, self.max_model_len)
+            cap_candidates = [w.model_cap for w in prompt_windows if w.model_cap > 0]
+            if cap_candidates:
+                pre_cap_tokens = min(self.max_model_len, max_tokens, max(cap_candidates))
+            else:
+                pre_cap_tokens = min(max_tokens, self.max_model_len)
             if dbg:
-                print(f"[PreCap] chosen_max_tokens={pre_cap_tokens} (no char-based cap)")
+                print(f"[PreCap] chosen_max_tokens={pre_cap_tokens}")
 
             # Stop token id for truncation and stopping conditions
             stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
             if dbg:
-                print(f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
-                      f"max_tokens={pre_cap_tokens}, stop_token_ids={[stop_offset_id]}")
+                print(
+                    f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
+                    f"max_tokens={pre_cap_tokens}"
+                )
 
             start_time = time.time()
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
                     temperature=temp_use,
-                    stop_token_ids=[stop_offset_id],
                     max_tokens=pre_cap_tokens,
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
+                    logprobs=8,
                     *args, **kwargs,
                 )
             )
@@ -432,33 +428,54 @@ class ChatterboxTTS:
                         torch.cuda.empty_cache()
 
                     tok_ids = list(output.token_ids)
+                    window = prompt_windows[i] if i < len(prompt_windows) else None
+                    logprob_steps = getattr(output, "logprobs", None)
 
-                    # Debug EOS behavior
-                    if dbg:
-                        finish_reason = getattr(output, "finish_reason", None)
-                        stop_positions = [idx for idx, t in enumerate(tok_ids) if t == stop_offset_id]
-                        head = tok_ids[:10]
-                        tail = tok_ids[-10:]
-                        print(f"[T3][eos] finish_reason={finish_reason}, out_len={len(tok_ids)}, "
-                              f"stop_found={len(stop_positions)>0}, first_stop_idx={stop_positions[0] if stop_positions else None}, "
-                              f"head={head}, tail={tail}")
-
-                    # Truncate at first stop-of-speech; optionally crop K tokens before EOS
-                    if stop_offset_id in tok_ids:
-                        stop_idx = tok_ids.index(stop_offset_id)
-                        tok_ids = tok_ids[:stop_idx]
+                    if window is not None:
+                        tok_ids, decision = apply_dynamic_stop(
+                            tok_ids,
+                            logprob_steps=logprob_steps,
+                            window=window,
+                            stop_token_id=stop_offset_id,
+                            tail_crop_tokens=max(0, int(tail_crop_k)),
+                            debug=dbg,
+                        )
                         if dbg:
-                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}")
-                    else:
-                        if dbg:
-                            hit_max = len(tok_ids) >= pre_cap_tokens
-                            print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
+                            finish_reason = getattr(output, "finish_reason", None)
+                            print(
+                                f"[T3][stop] idx={i} finish={finish_reason} decision={decision}"
+                            )
+                    elif dbg:
+                        print("[T3][stop] missing prompt window; skipping dynamic EOS")
 
                     # Map to base speech token space and drop invalids
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
 
+                    # Dynamic overrun guard based on character length estimate
+                    try:
+                        window_guard = prompt_windows[i].guard_tokens if i < len(prompt_windows) else None
+                        guard_cap = window_guard or 0
+                        if not guard_cap:
+                            prompt_str = request_items[i].get("prompt", "")
+                            prompt_clean = re.sub(r"\[[^\]]+\]", "", prompt_str)
+                            char_len = sum(1 for c in prompt_clean if not c.isspace())
+                            tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                            tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                            tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                            guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                            est_tokens = int(math.ceil(char_len * tpc))
+                            est_tokens = max(tmin, min(tmax, est_tokens))
+                            guard_cap = int(math.ceil(est_tokens * guard_mult))
+                        n_tokens_cur = int(speech_tokens.shape[0]) if speech_tokens.ndim == 1 else int(speech_tokens.shape[1])
+                        if guard_cap and n_tokens_cur > guard_cap:
+                            if dbg:
+                                print(f"[Guard] guard={guard_cap} n_tokens={n_tokens_cur} -> cap")
+                            speech_tokens = speech_tokens[:guard_cap]
+                    except Exception as _e:
+                        if dbg:
+                            print(f"[Guard] skipped due to error: {_e}")
 
                     # Render audio
                     wav, _ = self.s3gen.inference(
