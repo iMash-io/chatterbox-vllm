@@ -383,7 +383,7 @@ async def _synthesize_streaming_pcm_frames(
 
     last_emitted = 0
 
-    async def _render_prefix(n_tok: int, steps: int) -> torch.Tensor:
+    def _render_prefix(n_tok: int, steps: int) -> torch.Tensor:
         tok_prefix = tokens_1d[:n_tok]
         if tok_prefix.numel() == 0:
             return torch.zeros(1, 0, dtype=torch.float32, device="cpu")
@@ -400,8 +400,7 @@ async def _synthesize_streaming_pcm_frames(
     while True:
         cur_tokens = min(cur_tokens, total_tokens)
         steps_use = (first_chunk_diff_steps if (not first_done and first_chunk_diff_steps is not None) else diffusion_steps)
-        wav: torch.Tensor = await asyncio.to_thread(lambda: torch.utils._pytree.tree_map(lambda x: x, None))  # no-op to yield control
-        wav = await asyncio.to_thread(_render_prefix, cur_tokens, steps_use)
+        wav: torch.Tensor = await asyncio.to_thread(_render_prefix, cur_tokens, steps_use)
 
         # Alignment cap by expected samples from token count (+ optional safety)
         cap = min(wav.shape[1], tokens_to_samples(cur_tokens) + align_safety)
@@ -554,6 +553,9 @@ async def create_speech(req: SpeechRequest):
                 first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
+                holdback_ms=req.holdback_ms or 40,
+                flush_ms=req.flush_ms or 80,
+                align_safety_ms=req.align_safety_ms or 0,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,
