@@ -662,6 +662,129 @@ class ChatterboxMultilingualTTS:
 
             return results
         
+    # --- New: token-streaming interface for true audio streaming (multilingual) ---
+    def stream_tokens_with_conds(
+        self,
+        prompts: Union[str, list[str]],
+        s3gen_ref: dict[str, Any],
+        cond_emb: torch.Tensor,
+        language_id: Optional[Union[str, list[str]]] = None,
+        temperature: float = 0.4,
+        exaggeration: float = 0.5,
+        max_tokens: int = 1000,
+        diffusion_steps: int = 10,
+        top_p: float = 0.4,
+        repetition_penalty: float = 2.0,
+        *args, **kwargs,
+    ):
+        """
+        Yield incremental NEW speech tokens (already mapped to S3 id-space)
+        as vLLM generates them for a single prompt (multilingual path).
+        """
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        assert len(prompts) == 1, "stream_tokens_with_conds (mtl) supports a single prompt"
+
+        # Update exaggeration into conds
+        cond_emb = self.update_exaggeration(cond_emb, exaggeration)
+
+        # Normalize prompt and inject language markers like generate_with_conds
+        if language_id is None:
+            lang_ids = [None]
+        elif isinstance(language_id, str):
+            lang_ids = [language_id]
+        else:
+            lang_ids = language_id
+            if len(lang_ids) != 1:
+                raise ValueError("language_id list must be length 1 for streaming")
+
+        normalized = punc_norm(prompts[0])
+        lang = lang_ids[0]
+        if lang:
+            text = f"[{lang.lower()}][START]{normalized}[STOP]"
+        else:
+            text = f"[START]{normalized}[STOP]"
+
+        # Clamp sampling for multilingual stability if a language is specified
+        temp_use = min(temperature, 0.5) if lang else temperature
+        top_p_use = min(top_p, 0.5) if lang else top_p
+
+        request_item = {
+            "prompt": text,
+            "multi_modal_data": {"conditionals": [cond_emb]},
+        }
+        if lang:
+            request_item["tokenization_kwargs"] = {"language_id": lang.lower()}
+
+        stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
+
+        gen_iter = self.t3.generate(
+            [request_item],
+            sampling_params=SamplingParams(
+                temperature=temp_use,
+                stop_token_ids=[stop_offset_id],
+                max_tokens=min(max_tokens, self.max_model_len),
+                top_p=top_p_use,
+                repetition_penalty=repetition_penalty,
+                *args, **kwargs,
+            ),
+            use_stream=True,
+        )
+
+        prev_len = 0
+        for req_out in gen_iter:
+            if not req_out.outputs:
+                continue
+            out = req_out.outputs[0]
+            cur_ids = list(out.token_ids)
+            if len(cur_ids) <= prev_len:
+                continue
+            new_ids = cur_ids[prev_len:]
+            prev_len = len(cur_ids)
+
+            # Map and sanitize
+            speech_tokens = torch.tensor(
+                [tok - SPEECH_TOKEN_OFFSET for tok in new_ids], device="cuda"
+            )
+            speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = speech_tokens[speech_tokens < 6561]
+            if speech_tokens.numel() > 0:
+                yield speech_tokens.tolist()
+
+        # end of stream
+
+    def stream_tokens(
+        self,
+        prompt: str,
+        *,
+        audio_prompt_path: Optional[str] = None,
+        language_id: Optional[str] = None,
+        exaggeration: float = 0.5,
+        temperature: float = 0.4,
+        max_tokens: int = 1000,
+        diffusion_steps: int = 10,
+        top_p: float = 0.4,
+        repetition_penalty: float = 2.0,
+        **kwargs,
+    ):
+        """
+        Convenience wrapper that computes conditionals once and streams tokens (multilingual).
+        """
+        s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
+        yield from self.stream_tokens_with_conds(
+            [prompt],
+            s3gen_ref=s3gen_ref,
+            cond_emb=cond_emb,
+            language_id=language_id,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            max_tokens=max_tokens,
+            diffusion_steps=diffusion_steps,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            **kwargs,
+        )
+
     def shutdown(self):
         del self.t3
         torch.cuda.empty_cache()
