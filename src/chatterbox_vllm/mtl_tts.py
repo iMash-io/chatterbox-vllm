@@ -6,6 +6,7 @@ import os
 import re
 import math
 import unicodedata
+import json
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -25,6 +26,40 @@ from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import punc_norm
+
+# Language-specific trim configuration
+@lru_cache(maxsize=1)
+def _get_lang_trim_config() -> dict:
+    """
+    Load per-language trim/alignment overrides from lang_trim_config.json
+    located next to this module. Returns {} if missing/invalid.
+    """
+    cfg_path = Path(__file__).resolve().parent / "lang_trim_config.json"
+    try:
+        with open(cfg_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _get_lang_from_prompt_text(prompt: str) -> Optional[str]:
+    """
+    Extract leading [xx] language tag from prompt if present.
+    """
+    m = re.match(r"\[([a-z]{2})\]", (prompt or "").strip())
+    return m.group(1).lower() if m else None
+
+def _merge_lang_cfg(lang: Optional[str]) -> dict:
+    """
+    Merge default config with language-specific overrides.
+    """
+    cfg = _get_lang_trim_config()
+    base = cfg.get("default", {}) or {}
+    if isinstance(lang, str):
+        lang = lang.lower()
+    over = cfg.get(lang, {}) if lang else {}
+    merged = dict(base)
+    merged.update(over or {})
+    return merged
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -592,6 +627,58 @@ class ChatterboxMultilingualTTS:
                     stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
                     tok_ids = list(output.token_ids)
 
+                    # Determine language for this item and load per-language overrides
+                    try:
+                        lang_code = (language_ids[i].lower() if language_ids and isinstance(language_ids, list) and language_ids[i] else None)
+                    except Exception:
+                        lang_code = None
+                    if not lang_code:
+                        lang_code = _get_lang_from_prompt_text(request_items[i].get("prompt", ""))
+
+                    cfg_i = _merge_lang_cfg(lang_code)
+
+                    # Per-language overrides (fallback to env-derived base values above)
+                    try:
+                        tail_crop_k_local = int(cfg_i.get("tail_crop_tokens", tail_crop_k))
+                    except Exception:
+                        tail_crop_k_local = tail_crop_k if 'tail_crop_k' in locals() else 2
+
+                    # Align safety per language (ms)
+                    try:
+                        align_safety_ms_local = int(cfg_i.get("align_safety_ms", int(os.environ.get("CHATTERBOX_ALIGN_SAFETY_MS", "0"))))
+                    except Exception:
+                        align_safety_ms_local = int(os.environ.get("CHATTERBOX_ALIGN_SAFETY_MS", "0"))
+
+                    # Trim thresholds per language
+                    try:
+                        tail_trim_db = float(cfg_i.get("tail_trim_db", tail_trim_db))
+                    except Exception:
+                        pass
+                    try:
+                        tail_trim_db_rel = float(cfg_i.get("tail_trim_db_rel", tail_trim_db_rel))
+                    except Exception:
+                        pass
+                    try:
+                        tail_trim_safety_ms = int(cfg_i.get("tail_trim_safety_ms", tail_trim_safety_ms))
+                    except Exception:
+                        pass
+
+                    # Head trim safety per language
+                    try:
+                        head_trim_safety_ms = int(cfg_i.get("head_trim_safety_ms", head_trim_safety_ms))
+                    except Exception:
+                        pass
+
+                    # Tail amplitude finalizer overrides
+                    try:
+                        tail_abs_thr = float(cfg_i.get("tail_abs_thresh", float(os.environ.get("CHATTERBOX_TAIL_ABS_THRESH", "0.003"))))
+                    except Exception:
+                        tail_abs_thr = float(os.environ.get("CHATTERBOX_TAIL_ABS_THRESH", "0.003"))
+                    try:
+                        tail_min_sil_ms = int(cfg_i.get("tail_min_sil_ms", int(os.environ.get("CHATTERBOX_TAIL_MIN_SIL_MS", "120"))))
+                    except Exception:
+                        tail_min_sil_ms = int(os.environ.get("CHATTERBOX_TAIL_MIN_SIL_MS", "120"))
+
                     # Debug: summarize EOS behavior
                     if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                         finish_reason = getattr(output, "finish_reason", None)
@@ -605,7 +692,7 @@ class ChatterboxMultilingualTTS:
                     if stop_offset_id in tok_ids:
                         stop_idx = tok_ids.index(stop_offset_id)
                         # Optional token-tail crop: drop K tokens immediately before EOS to avoid artifacts
-                        new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
+                        new_end = max(0, stop_idx - max(0, int(tail_crop_k_local)))
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                             removed = len(tok_ids) - new_end
                             tail_preview = tok_ids[max(0, new_end-10):new_end]
@@ -658,8 +745,7 @@ class ChatterboxMultilingualTTS:
                         n_tokens = int(speech_tokens.numel())
                     expected_samples = int(round(n_tokens * (self.sr / S3_TOKEN_RATE)))
                     align_on = os.environ.get("CHATTERBOX_ALIGN_HARD", "1").lower() in ("1","true","yes","on")
-                    align_safety_ms = int(os.environ.get("CHATTERBOX_ALIGN_SAFETY_MS", "0"))
-                    align_safety = max(0, int(self.sr * align_safety_ms / 1000))
+                    align_safety = max(0, int(self.sr * align_safety_ms_local / 1000))
                     if align_on and wav is not None and wav.numel() > 0:
                         cap = min(wav.shape[1], expected_samples + align_safety)
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
@@ -749,8 +835,6 @@ class ChatterboxMultilingualTTS:
 
                     # Amplitude-based tail trim (finalizer)
                     tail_abs_on = os.environ.get("CHATTERBOX_TAIL_ABS_TRIM", "1").lower() in ("1","true","yes","on")
-                    tail_abs_thr = float(os.environ.get("CHATTERBOX_TAIL_ABS_THRESH", "0.003"))
-                    tail_min_sil_ms = int(os.environ.get("CHATTERBOX_TAIL_MIN_SIL_MS", "120"))
                     if tail_abs_on and wav is not None and wav.numel() > 0:
                         wabs = torch.abs(wav.squeeze(0))
                         nz = torch.nonzero(wabs > tail_abs_thr, as_tuple=False)

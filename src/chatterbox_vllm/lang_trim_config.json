@@ -1,0 +1,42 @@
+{
+  "default": {
+    "align_safety_ms": 10,
+    "tail_trim_db": -42,
+    "tail_trim_db_rel": -35,
+    "tail_trim_safety_ms": 50,
+    "tail_abs_thresh": 0.003,
+    "tail_min_sil_ms": 120,
+    "tail_crop_tokens": 2,
+    "head_trim_safety_ms": 50
+  },
+  "he": {
+    "align_safety_ms": 25,
+    "tail_trim_db": -48,
+    "tail_trim_db_rel": -40,
+    "tail_trim_safety_ms": 60,
+    "tail_abs_thresh": 0.0025,
+    "tail_min_sil_ms": 160,
+    "tail_crop_tokens": 0,
+    "head_trim_safety_ms": 70
+  },
+  "ar": {
+    "align_safety_ms": 20,
+    "tail_trim_db": -46,
+    "tail_trim_db_rel": -38,
+    "tail_trim_safety_ms": 60,
+    "tail_abs_thresh": 0.0028,
+    "tail_min_sil_ms": 150,
+    "tail_crop_tokens": 1,
+    "head_trim_safety_ms": 60
+  },
+  "zh": {
+    "align_safety_ms": 12,
+    "tail_trim_db": -44,
+    "tail_trim_db_rel": -36,
+    "tail_trim_safety_ms": 50,
+    "tail_abs_thresh": 0.003,
+    "tail_min_sil_ms": 120,
+    "tail_crop_tokens": 2,
+    "head_trim_safety_ms": 50
+  }
+}
