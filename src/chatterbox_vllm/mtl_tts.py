@@ -318,11 +318,11 @@ class ChatterboxMultilingualTTS:
         language_id: Optional[Union[str, list[str]]] = None,
         audio_prompt_path: Optional[str] = None,
         exaggeration: float = 0.5,
-        temperature: float = 0.8,
+        temperature: float = 0.4,
         max_tokens=1000, # Capped at max_model_len
 
         # From original Chatterbox HF generation args
-        top_p=0.8,
+        top_p=0.4,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
@@ -381,7 +381,7 @@ class ChatterboxMultilingualTTS:
         s3gen_ref: dict[str, Any],
         cond_emb: torch.Tensor,
         language_id: Optional[Union[str, list[str]]] = None,
-        temperature: float = 0.8,
+        temperature: float = 0.4,
         exaggeration: float = 0.5,
         max_tokens=1000, # Capped at max_model_len
 
@@ -391,7 +391,7 @@ class ChatterboxMultilingualTTS:
         diffusion_steps: int = 10,
 
         # From original Chatterbox HF generation args
-        top_p=0.8,
+        top_p=0.4,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
@@ -434,14 +434,23 @@ class ChatterboxMultilingualTTS:
 
         with torch.inference_mode():
             start_time = time.time()
+            # Clamp sampling for multilingual stability when language_id is specified
+            temp_use = temperature
+            top_p_use = top_p
+            if any(language_ids):
+                temp_use = min(temperature, 0.5)
+                top_p_use = min(top_p, 0.5)
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
+
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
-                    temperature=temperature,
+                    temperature=temp_use,
 
                     stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
                     max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
+                    top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
 
                     *args, **kwargs,
@@ -464,7 +473,14 @@ class ChatterboxMultilingualTTS:
                     if i % 10 == 0:
                         torch.cuda.empty_cache()
 
-                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
+                    # Truncate at the first emitted stop-of-speech token if present
+                    stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
+                    tok_ids = list(output.token_ids)
+                    if stop_offset_id in tok_ids:
+                        stop_idx = tok_ids.index(stop_offset_id)
+                        tok_ids = tok_ids[:stop_idx]
+                    # Map back to base speech token space
+                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
 
