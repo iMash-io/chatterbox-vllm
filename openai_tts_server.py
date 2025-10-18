@@ -397,6 +397,7 @@ def _synthesize_one(
     exaggeration: float,
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
+    max_tokens_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Synthesize one prompt to a waveform (1, T) tensor.
@@ -427,7 +428,7 @@ def _synthesize_one(
         temperature=temperature,
         exaggeration=exaggeration,
         diffusion_steps=diffusion_steps,
-        max_tokens=tts.max_model_len,
+        max_tokens=min(max_tokens_override if max_tokens_override is not None else tts.max_model_len, tts.max_model_len),
         **extra_sampling_kwargs,
     )
     if not waves:
@@ -471,17 +472,26 @@ async def _synthesize_streaming_pcm_frames(
             await asyncio.sleep(0)
 
     # Build chunks: small first chunk, larger subsequent chunks
+    # Avoid substring slicing (which can misalign in RTL/CJK and with normalization).
+    all_chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
     chunks: List[str] = []
-    if first_chunk_chars and first_chunk_chars > 0:
-        fchunks = _split_text_for_low_latency(text, max_chars=first_chunk_chars)
-        if fchunks:
-            first_text = fchunks[0]
-            chunks.append(first_text)
-            remaining = text[len(first_text):].strip()
-            if remaining:
-                chunks.extend(_split_text_for_low_latency(remaining, max_chars=chunk_chars))
+    if first_chunk_chars and first_chunk_chars > 0 and all_chunks:
+        # If the first natural chunk exceeds first_chunk_chars, split just that chunk further.
+        if len(all_chunks[0]) > first_chunk_chars:
+            first_split = _split_text_for_low_latency(all_chunks[0], max_chars=first_chunk_chars)
+            if first_split:
+                # Take smallest first part, then any remaining parts from that split, then the rest of the chunks
+                chunks.append(first_split[0])
+                if len(first_split) > 1:
+                    chunks.extend(first_split[1:])
+                if len(all_chunks) > 1:
+                    chunks.extend(all_chunks[1:])
+            else:
+                chunks = all_chunks
+        else:
+            chunks = all_chunks
     else:
-        chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
+        chunks = all_chunks
 
     # Repair chunk boundaries to avoid starting chunks with punctuation for better prosody
     chunks = _repair_chunk_boundaries(chunks)
@@ -497,6 +507,34 @@ async def _synthesize_streaming_pcm_frames(
         if idx == 0 and first_chunk_diff_steps is not None:
             steps = max(1, int(first_chunk_diff_steps))
 
+        # Compute a conservative per-chunk token cap to encourage early EOS and avoid drift/silence
+        try:
+            tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+            clen = sum(1 for c in chunk if not c.isspace())
+
+            # Window overrides take precedence if provided
+            win_first = int(os.environ.get("CHATTERBOX_FIRST_WINDOW_TOKENS", "0"))
+            win_stream = int(os.environ.get("CHATTERBOX_STREAM_WINDOW_TOKENS", "0"))
+            if idx == 0 and win_first > 0:
+                max_cap = win_first
+            elif idx > 0 and win_stream > 0:
+                max_cap = win_stream
+            else:
+                if idx == 0:
+                    guard_mult = float(os.environ.get("CHATTERBOX_FIRST_GUARD_MULT", "1.15"))
+                    pre_margin = int(os.environ.get("CHATTERBOX_FIRST_PRE_MARGIN", "8"))
+                    tmin = int(os.environ.get("CHATTERBOX_FIRST_TOKENS_MIN", "24"))
+                else:
+                    guard_mult = float(os.environ.get("CHATTERBOX_STREAM_GUARD_MULT", "1.30"))
+                    pre_margin = int(os.environ.get("CHATTERBOX_STREAM_PRE_MARGIN", "12"))
+                    tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                est = max(tmin, min(tmax_env, int(math.ceil(clen * tpc))))
+                # tighter than offline guard: est + small margin, but never exceeding guard_mult cap
+                max_cap = max(1, min(est + pre_margin, int(math.ceil(est * guard_mult))))
+        except Exception:
+            max_cap = None
+
         # Heavy compute dispatched to thread to not block event loop
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
@@ -506,6 +544,7 @@ async def _synthesize_streaming_pcm_frames(
             exaggeration=exaggeration,
             diffusion_steps=steps,
             audio_prompt_path=audio_prompt_path,
+            max_tokens_override=max_cap,
         )
 
         # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)

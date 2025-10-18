@@ -609,6 +609,36 @@ class ChatterboxMultilingualTTS:
                             print(f"[Align] tokens={n_tokens} expected_samples={expected_samples} safety={align_safety} cap={cap} wav_in={wav.shape[1]}")
                         wav = wav[:, :cap]
 
+                    # Energy-based head trim (RMS) to remove initial silence
+                    if os.environ.get("CHATTERBOX_HEAD_TRIM", "1").lower() in ("1","true","yes","on") and wav is not None and wav.numel() > 0:
+                        sr = self.sr
+                        frame_len = max(1, int(sr * rms_window_ms / 1000))
+                        hop_len = max(1, int(sr * rms_hop_ms / 1000))
+                        if wav.shape[1] >= frame_len:
+                            x2 = (wav.unsqueeze(0) ** 2)
+                            x2 = x2 if x2.ndim == 3 else x2.view(1, 1, -1)
+                            kernel = torch.ones(1, 1, frame_len, device=wav.device, dtype=wav.dtype) / frame_len
+                            rms = torch.sqrt(torch.nn.functional.conv1d(x2, kernel, stride=hop_len)).squeeze()
+                            peak = float(rms.max().item()) if rms.numel() > 0 else 0.0
+                            if peak > 0:
+                                head_trim_db_rel = float(os.environ.get("CHATTERBOX_HEAD_TRIM_DB_REL", "-35"))
+                                thr = peak * (10.0 ** (head_trim_db_rel / 20.0))
+                            else:
+                                head_trim_db = float(os.environ.get("CHATTERBOX_HEAD_TRIM_DB", "-42"))
+                                thr = 10.0 ** (head_trim_db / 20.0)
+                            active = torch.where(rms > thr)[0]
+                            if active.numel() > 0:
+                                first_active = int(active[0].item())
+                                safety = int(sr * int(os.environ.get("CHATTERBOX_HEAD_TRIM_SAFETY_MS", "50")) / 1000)
+                                start = max(0, first_active * hop_len - safety)
+                                if start > 0:
+                                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                        print(f"[Head][rms] trim: first_active_frame={first_active} safety={safety} cut_samples={start}")
+                                    wav = wav[:, start:].contiguous()
+                        else:
+                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                print(f"[Head][rms] skip: wav too short for frame_len={frame_len} (len={wav.shape[1]})")
+
                     # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
                     if tail_trim_on and wav is not None and wav.numel() > 0:
                         sr = self.sr
