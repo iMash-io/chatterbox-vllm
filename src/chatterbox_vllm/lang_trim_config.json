@@ -10,15 +10,15 @@
     "head_trim_safety_ms": 50
   },
   "he": {
-    "align_safety_ms": 60,
-    "tail_trim_db": -50,
-    "tail_trim_db_rel": -42,
-    "tail_trim_safety_ms": 90,
-    "tail_abs_thresh": 0.0018,
-    "tail_min_sil_ms": 240,
+    "align_safety_ms": 30,
+    "tail_trim_db": -46,
+    "tail_trim_db_rel": -38,
+    "tail_trim_safety_ms": 60,
+    "tail_abs_thresh": 0.0022,
+    "tail_min_sil_ms": 180,
     "tail_crop_tokens": 0,
     "head_trim_safety_ms": 80,
-    "tokens_per_char": 2.0,
+    "tokens_per_char": 2.3,
     "pre_guard_margin": 48
   },
   "ar": {
