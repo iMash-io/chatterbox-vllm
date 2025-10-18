@@ -541,7 +541,15 @@ async def create_speech(req: SpeechRequest):
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
+        # Default primer: force headers to flush within a few ms even if client didn't request it.
         try:
+            default_primer_ms = int(os.environ.get("CHATTERBOX_DEFAULT_PRIMER_MS", "10"))
+        except Exception:
+            default_primer_ms = 10
+        primer_ms = req.primer_silence_ms if (req.primer_silence_ms and req.primer_silence_ms > 0) else default_primer_ms
+        try:
+            if (req.primer_silence_ms or 0) <= 0 and default_primer_ms > 0:
+                print(f"[API] Applying default primer_silence_ms={default_primer_ms} to flush headers ASAP")
             print("[API] Using STREAMING path (StreamingResponse, chunked)")
         except Exception:
             pass
@@ -554,7 +562,7 @@ async def create_speech(req: SpeechRequest):
                 diffusion_steps=req.diffusion_steps or 10,
                 audio_prompt_path=req.audio_prompt_path,
                 watermark=req.watermark or "off",
-                primer_silence_ms=req.primer_silence_ms or 0,
+                primer_silence_ms=primer_ms,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
                 first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,

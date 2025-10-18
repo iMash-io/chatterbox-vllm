@@ -158,78 +158,108 @@ class S3StreamRenderer:
 
     def _best_shift_by_corr(self, a: torch.Tensor, b: torch.Tensor, max_shift: int) -> int:
         """
-        Find shift s in [0, max_shift] that maximizes normalized cross-correlation between:
+        Find shift s in [-max_shift, +max_shift] that maximizes normalized cross-correlation
+        between the tail of 'a' and the head of 'b' with appropriate overlap.
           a: (1, L)
-          b[:, s:s+L]
-        Returns best shift (int). If invalid, returns 0.
+          b: (1, M)
+        Positive s means we advance into b (delay new_wav). Negative s means we consume fewer
+        samples from the tail of 'a' and start b earlier.
         """
         L = a.shape[1]
-        if L <= 1 or b.shape[1] < L:
+        M = b.shape[1]
+        if L <= 1 or M <= 1:
             return 0
-        max_shift = max(0, min(max_shift, b.shape[1] - L))
-        # Precompute norms
         eps = 1e-8
         a_flat = a.squeeze(0)
-        a_norm = torch.linalg.vector_norm(a_flat).item() + eps
         best_s = 0
         best_score = -1.0
-        for s in range(0, max_shift + 1):
+
+        # Positive/zero shifts: compare a[:L] with b[s:s+L]
+        max_pos = max(0, min(max_shift, max(0, M - L)))
+        a_norm_full = torch.linalg.vector_norm(a_flat).item() + eps
+        for s in range(0, max_pos + 1):
             seg = b[:, s:s + L].squeeze(0)
             if seg.shape[0] != L:
                 break
-            denom = (torch.linalg.vector_norm(seg).item() + eps) * a_norm
+            denom = (torch.linalg.vector_norm(seg).item() + eps) * a_norm_full
             if denom <= eps:
                 continue
             score = float(torch.dot(a_flat, seg) / denom)
             if score > best_score:
                 best_score = score
                 best_s = s
+
+        # Negative shifts: overlap length C = L + s (since s < 0)
+        max_neg = max(0, min(max_shift, L - 1))
+        for s in range(-max_neg, 0):
+            C = L + s  # s is negative, so C < L
+            if C <= 1:
+                continue
+            a_seg = a_flat[-C:]
+            b_seg = b[:, 0:C].squeeze(0)
+            denom = (torch.linalg.vector_norm(a_seg).item() + eps) * (torch.linalg.vector_norm(b_seg).item() + eps)
+            if denom <= eps:
+                continue
+            score = float(torch.dot(a_seg, b_seg) / denom)
+            if score > best_score:
+                best_score = score
+                best_s = s
+
         return best_s
 
     def _align_and_blend(self, prev_tail: torch.Tensor, new_wav: torch.Tensor, overlap_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Align the new window head to the previous tail via correlation, then crossfade.
-        Returns (out_chunk, new_tail)
+        Supports negative/positive shifts. Returns (out_chunk, new_tail).
         """
         if overlap_samples <= 0 or prev_tail.shape[1] == 0 or new_wav.shape[1] == 0:
             return new_wav, new_wav
 
-        # Lengths in samples
+        # Compute segment and search windows
         seg_len = min(overlap_samples, max(1, int(self.sr * self.align_seg_ms / 1000)))
         search_pad = max(0, int(self.sr * self.align_search_ms / 1000))
 
         if prev_tail.shape[1] < seg_len:
             seg_len = prev_tail.shape[1]
-        # Extract segments
         a = prev_tail[:, -seg_len:]  # (1, seg_len)
-        # Ensure new_wav has enough head for search
         head_needed = seg_len + search_pad
         head_buf = new_wav[:, :max(head_needed, 1)]
-        # Compute best shift in [0, search_pad]
+
         best_shift = 0
-        if head_buf.shape[1] >= seg_len:
+        if head_buf.shape[1] >= 1:
             best_shift = self._best_shift_by_corr(a, head_buf, search_pad)
 
-        # Crossfade length is seg_len (could be less than overlap_samples)
-        C = seg_len
-        if head_buf.shape[1] - best_shift < C:
-            C = max(1, head_buf.shape[1] - best_shift)
-        if C <= 1:
-            # Not enough to crossfade; emit what we have
-            return new_wav, new_wav[:, -overlap_samples:] if new_wav.shape[1] >= overlap_samples else new_wav
+        # Determine crossfade length C based on shift and available samples
+        if best_shift >= 0:
+            C = min(seg_len, max(1, head_buf.shape[1] - best_shift))
+            if C <= 1:
+                aligned_tail = new_wav[:, best_shift:]
+                new_tail = aligned_tail[:, -overlap_samples:] if aligned_tail.shape[1] >= overlap_samples else aligned_tail
+                return new_wav[:, best_shift:], new_tail
 
-        fade = _cosine_ramp(C, device=new_wav.device, dtype=new_wav.dtype).unsqueeze(0)
-        fade_in = fade
-        fade_out = 1.0 - fade
+            fade = _cosine_ramp(C, device=new_wav.device, dtype=new_wav.dtype).unsqueeze(0)
+            fused_overlap = a[:, -C:] * (1.0 - fade) + new_wav[:, best_shift:best_shift + C] * fade
+            rest = new_wav[:, best_shift + C:] if (best_shift + C) < new_wav.shape[1] else torch.zeros(1, 0, dtype=new_wav.dtype)
+            out = torch.cat([fused_overlap, rest], dim=1)
+            aligned_tail = new_wav[:, best_shift:]
+            new_tail = aligned_tail[:, -overlap_samples:] if aligned_tail.shape[1] >= overlap_samples else aligned_tail
+            return out, new_tail
+        else:
+            # Negative shift: overlap C = seg_len + best_shift (since best_shift < 0)
+            C = seg_len + best_shift
+            if C <= 1:
+                # Almost no overlap; emit new_wav as is
+                tail = new_wav[:, -overlap_samples:] if new_wav.shape[1] >= overlap_samples else new_wav
+                return new_wav, tail
 
-        fused_overlap = a[:, -C:] * fade_out + new_wav[:, best_shift:best_shift + C] * fade_in
-        rest = new_wav[:, best_shift + C:] if (best_shift + C) < new_wav.shape[1] else torch.zeros(1, 0, dtype=new_wav.dtype)
-        out = torch.cat([fused_overlap, rest], dim=1)
-
-        # New tail: last overlap_samples of the aligned new window
-        aligned_tail = new_wav[:, best_shift:]
-        new_tail = aligned_tail[:, -overlap_samples:] if aligned_tail.shape[1] >= overlap_samples else aligned_tail
-        return out, new_tail
+            a_seg = a[:, -C:]
+            b_seg = new_wav[:, 0:C]
+            fade = _cosine_ramp(C, device=new_wav.device, dtype=new_wav.dtype).unsqueeze(0)
+            fused_overlap = a_seg * (1.0 - fade) + b_seg * fade
+            rest = new_wav[:, C:] if C < new_wav.shape[1] else torch.zeros(1, 0, dtype=new_wav.dtype)
+            out = torch.cat([fused_overlap, rest], dim=1)
+            new_tail = new_wav[:, -overlap_samples:] if new_wav.shape[1] >= overlap_samples else new_wav
+            return out, new_tail
 
     def _pick_overlap_samples(self, overlap_tokens: int) -> int:
         if self._overlap_samples_fixed is not None:
