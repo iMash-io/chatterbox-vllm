@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+import shutil
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
@@ -169,6 +170,22 @@ class ChatterboxTTS:
         model_safetensors_path = Path.cwd() / "t3-model" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
+
+        # Ensure tokenizer.json is available to the custom EnTokenizer resolver:
+        # Copy the HF-downloaded tokenizer.json into ./t3-model/tokenizer.json so vLLM picks the correct vocab.
+        try:
+            tok_src = Path(local_path).parent / "tokenizer.json"
+            tok_dst_dir = Path.cwd() / "t3-model"
+            tok_dst_dir.mkdir(parents=True, exist_ok=True)
+            tok_dst = tok_dst_dir / "tokenizer.json"
+            if tok_src.exists():
+                tok_dst.unlink(missing_ok=True)
+                shutil.copy(tok_src, tok_dst)
+                print(f"[TTS] Copied tokenizer.json to {tok_dst}")
+            else:
+                print("[TTS][WARN] tokenizer.json not found next to weights; relying on package-local fallback")
+        except Exception as _e:
+            print(f"[TTS][WARN] Failed to copy tokenizer.json: {_e}")
 
         return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
 

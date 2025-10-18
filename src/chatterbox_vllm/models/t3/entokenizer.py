@@ -44,16 +44,42 @@ class EnTokenizer(PreTrainedTokenizer):
         self.check_vocabset_sot_eot()
 
     @classmethod
-    def from_pretrained(cls, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: Optional[str] = None, **kwargs):
         """
         Instantiate a tokenizer from a pretrained model or path.
-        
-        Args:
-            pretrained_model_name_or_path: Path to the tokenizer file or model name
-            **kwargs: Additional arguments to pass to the tokenizer
+
+        Resolution order:
+        1) If a valid directory is provided via pretrained_model_name_or_path, try:
+           - <dir>/tokenizer.json
+        2) Fallback to ./t3-model in CWD:
+           - t3-model/tokenizer.json
+        3) Fallback to the package-local tokenizer.json (legacy)
         """
-        # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+        candidates: list[str] = []
+
+        # 1) Provided directory
+        if pretrained_model_name_or_path and os.path.isdir(pretrained_model_name_or_path):
+            candidates.append(os.path.join(pretrained_model_name_or_path, "tokenizer.json"))
+
+        # 2) Default English model dir in CWD
+        cwd_model_dir = os.path.join(os.getcwd(), "t3-model")
+        if os.path.isdir(cwd_model_dir):
+            candidates.append(os.path.join(cwd_model_dir, "tokenizer.json"))
+
+        # 3) Package-local legacy fallback
+        pkg_local = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+        candidates.append(pkg_local)
+
+        vocab_file = None
+        for c in candidates:
+            if os.path.isfile(c):
+                vocab_file = c
+                break
+
+        if vocab_file is None:
+            raise FileNotFoundError("EnTokenizer: could not locate tokenizer.json")
+
+        print(f"[EnTokenizer] Selected vocab file: {vocab_file}")
         return cls(vocab_file=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):
