@@ -10,14 +10,14 @@
     "head_trim_safety_ms": 50
   },
   "he": {
-    "align_safety_ms": 25,
-    "tail_trim_db": -48,
-    "tail_trim_db_rel": -40,
+    "align_safety_ms": 35,
+    "tail_trim_db": -46,
+    "tail_trim_db_rel": -38,
     "tail_trim_safety_ms": 60,
-    "tail_abs_thresh": 0.0025,
-    "tail_min_sil_ms": 160,
+    "tail_abs_thresh": 0.0022,
+    "tail_min_sil_ms": 200,
     "tail_crop_tokens": 0,
-    "head_trim_safety_ms": 70
+    "head_trim_safety_ms": 80
   },
   "ar": {
     "align_safety_ms": 20,
