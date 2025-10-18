@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
+import os
 import time
 
 from vllm import LLM, SamplingParams
@@ -419,7 +420,7 @@ class ChatterboxTTS:
                     repetition_penalty=repetition_penalty,
                     *args, **kwargs,
                 ),
-                use_stream=True,  # may not be supported in some vLLM builds
+                stream=True,  # may not be supported in some vLLM builds
             )
 
             prev_len = 0

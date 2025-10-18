@@ -718,7 +718,49 @@ class ChatterboxMultilingualTTS:
 
         stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
 
-        gen_iter = self.t3.generate(
+        # Try native vLLM streaming first; fall back to compatibility mode.
+        try:
+            gen_iter = self.t3.generate(
+                [request_item],
+                sampling_params=SamplingParams(
+                    temperature=temp_use,
+                    stop_token_ids=[stop_offset_id],
+                    max_tokens=min(max_tokens, self.max_model_len),
+                    top_p=top_p_use,
+                    repetition_penalty=repetition_penalty,
+                    *args, **kwargs,
+                ),
+                stream=True,  # correct kwarg for vLLM 0.10.x
+            )
+
+            prev_len = 0
+            for req_out in gen_iter:
+                if not req_out.outputs:
+                    continue
+                out = req_out.outputs[0]
+                cur_ids = list(out.token_ids)
+                if len(cur_ids) <= prev_len:
+                    continue
+                new_ids = cur_ids[prev_len:]
+                prev_len = len(cur_ids)
+
+                # Map and sanitize
+                speech_tokens = torch.tensor(
+                    [tok - SPEECH_TOKEN_OFFSET for tok in new_ids], device="cuda"
+                )
+                speech_tokens = drop_invalid_tokens(speech_tokens)
+                speech_tokens = speech_tokens[speech_tokens < 6561]
+                if speech_tokens.numel() > 0:
+                    yield speech_tokens.tolist()
+            return
+        except TypeError:
+            pass
+        except Exception:
+            # If streaming fails for any reason, fall back to compatibility mode
+            pass
+
+        # Compatibility mode: run a single generate, then yield tokens in small slices
+        batch_results = self.t3.generate(
             [request_item],
             sampling_params=SamplingParams(
                 temperature=temp_use,
@@ -728,21 +770,14 @@ class ChatterboxMultilingualTTS:
                 repetition_penalty=repetition_penalty,
                 *args, **kwargs,
             ),
-            use_stream=True,
         )
-
-        prev_len = 0
-        for req_out in gen_iter:
-            if not req_out.outputs:
-                continue
-            out = req_out.outputs[0]
-            cur_ids = list(out.token_ids)
-            if len(cur_ids) <= prev_len:
-                continue
-            new_ids = cur_ids[prev_len:]
-            prev_len = len(cur_ids)
-
-            # Map and sanitize
+        if not batch_results:
+            return
+        out = batch_results[0].outputs[0]
+        all_ids = list(out.token_ids)
+        slice_sz = max(1, int(os.environ.get("CHATTERBOX_COMPAT_TOKEN_SLICE", "8")))
+        for i in range(0, len(all_ids), slice_sz):
+            new_ids = all_ids[i:i + slice_sz]
             speech_tokens = torch.tensor(
                 [tok - SPEECH_TOKEN_OFFSET for tok in new_ids], device="cuda"
             )
@@ -750,8 +785,7 @@ class ChatterboxMultilingualTTS:
             speech_tokens = speech_tokens[speech_tokens < 6561]
             if speech_tokens.numel() > 0:
                 yield speech_tokens.tolist()
-
-        # end of stream
+        return
 
     def stream_tokens(
         self,
