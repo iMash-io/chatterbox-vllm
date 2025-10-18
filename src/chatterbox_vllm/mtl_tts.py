@@ -488,11 +488,35 @@ class ChatterboxMultilingualTTS:
             # Clamp sampling for multilingual stability when language_id is specified
             temp_use = temperature
             top_p_use = top_p
+            repetition_penalty_use = repetition_penalty
             if any(language_ids):
                 temp_use = min(temperature, 0.5)
                 top_p_use = min(top_p, 0.5)
                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                     print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}")
+                # Per-language sampling overrides from JSON (e.g., for Hebrew stability)
+                try:
+                    # prefer explicit language_ids; fallback to tag in first prompt
+                    primary_lang = None
+                    try:
+                        primary_lang = next((lid for lid in language_ids if lid), None)
+                    except Exception:
+                        primary_lang = None
+                    if not primary_lang and request_items:
+                        primary_lang = _get_lang_from_prompt_text(request_items[0].get("prompt", ""))
+                    if primary_lang:
+                        cfg_lang = _merge_lang_cfg(primary_lang)
+                        if "temperature" in cfg_lang:
+                            temp_use = float(cfg_lang.get("temperature"))
+                        if "top_p" in cfg_lang:
+                            top_p_use = float(cfg_lang.get("top_p"))
+                        if "repetition_penalty" in cfg_lang:
+                            repetition_penalty_use = float(cfg_lang.get("repetition_penalty"))
+                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                            print(f"[T3] JSON overrides lang={primary_lang}: temperature={temp_use}, top_p={top_p_use}, repetition_penalty={repetition_penalty_use}")
+                except Exception as _e:
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[T3] JSON sampling override skipped: {_e}")
             # Optional deterministic decoding to remove cross-run variability
             if os.environ.get("CHATTERBOX_DETERMINISTIC", "0").lower() in ("1","true","yes","on"):
                 temp_use = 0.0
@@ -565,10 +589,19 @@ class ChatterboxMultilingualTTS:
 
                     clen = len(pclean)
 
-                    tpc = float(os.environ.get(f"CHATTERBOX_TOKENS_PER_CHAR_{lang.upper()}", tpc_map_default.get(lang, default_tpc)))
-                    guard_mult = float(os.environ.get(f"CHATTERBOX_TOKENS_GUARD_MULT_{lang.upper()}", guard_map_default.get(lang, default_guard)))
-                    tmin = int(os.environ.get(f"CHATTERBOX_TOKENS_MIN_{lang.upper()}", tmin_map_default.get(lang, default_tmin)))
-                    tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", str(default_tmax)))
+                    # Merge per-language JSON overrides for pre-cap knobs
+                    cfg_i = _merge_lang_cfg(lang)
+                    # Allow JSON to override tokens_per_char, guard_mult, tokens_min, tokens_max, pre_guard_margin
+                    tpc = float(cfg_i.get("tokens_per_char", os.environ.get(f"CHATTERBOX_TOKENS_PER_CHAR_{lang.upper()}", tpc_map_default.get(lang, default_tpc))))
+                    guard_mult = float(cfg_i.get("tokens_guard_mult", os.environ.get(f"CHATTERBOX_TOKENS_GUARD_MULT_{lang.upper()}", guard_map_default.get(lang, default_guard))))
+                    tmin = int(cfg_i.get("tokens_min", os.environ.get(f"CHATTERBOX_TOKENS_MIN_{lang.upper()}", tmin_map_default.get(lang, default_tmin))))
+                    tmax_env = int(cfg_i.get("tokens_max", os.environ.get("CHATTERBOX_TOKENS_MAX", str(default_tmax))))
+                    # If first item, apply per-language pre_guard_margin override
+                    if idx == 0:
+                        try:
+                            pre_margin = int(cfg_i.get("pre_guard_margin", pre_margin))
+                        except Exception:
+                            pass
 
                     est = int(math.ceil(clen * tpc))
                     est = max(tmin, min(tmax_env, est))
@@ -601,7 +634,7 @@ class ChatterboxMultilingualTTS:
                     stop_token_ids=[stop_offset_id],
                     max_tokens=pre_cap_tokens,
                     top_p=top_p_use,
-                    repetition_penalty=repetition_penalty,
+                    repetition_penalty=repetition_penalty_use,
 
                     *args, **kwargs,
                 )
