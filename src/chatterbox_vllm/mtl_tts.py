@@ -450,6 +450,23 @@ class ChatterboxMultilingualTTS:
         txtlen_sampling_margin = int(os.environ.get("CHATTERBOX_TXTLEN_SAMPLING_MARGIN_TOKENS", "24"))
         enable_txtlen_sampling_max = os.environ.get("CHATTERBOX_ENABLE_TXTLEN_SAMPLING_MAX", "1").lower() in ("1","true","yes","on")
 
+        # Precompute per-language ms-per-char and time budgets BEFORE computing SamplingParams
+        max_ms_per_char_default = float(os.environ.get("CHATTERBOX_MAX_MS_PER_CHAR", "0"))
+        max_ms_per_char_lang = []
+        for lang_id in language_ids:
+            key = f"CHATTERBOX_MAX_MS_PER_CHAR_{(lang_id or '').upper()}" if lang_id else None
+            if key and key in os.environ:
+                try:
+                    max_ms_per_char_lang.append(float(os.environ[key]))
+                except Exception:
+                    max_ms_per_char_lang.append(max_ms_per_char_default)
+            else:
+                max_ms_per_char_lang.append(max_ms_per_char_default)
+        # These are used to convert allowed ms to token budgets
+        min_utter_ms_noeos = int(os.environ.get("CHATTERBOX_MIN_UTTER_MS_NOEOS", "0"))
+        extra_tail_noeos_ms = int(os.environ.get("CHATTERBOX_EXTRA_TAIL_NOEOS_MS", "150"))
+        ms_per_token = float(os.environ.get("CHATTERBOX_MS_PER_TOKEN", "40"))
+
         char_counts = [len(t) for t in normalized_texts]
         tokens_limit_texts = [int(math.ceil(c * tpc)) for c, tpc in zip(char_counts, tokens_per_char_lang)] if normalized_texts else []
         allowed_tokens_time_items = [int(math.ceil((max(min_utter_ms_noeos, c * mpc) + extra_tail_noeos_ms) / ms_per_token)) for c, mpc in zip(char_counts, max_ms_per_char_lang)] if normalized_texts else []
@@ -497,26 +514,8 @@ class ChatterboxMultilingualTTS:
             tail_lowvar_window = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_WINDOW", "0"))
             tail_lowvar_min = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_MIN", "120"))
             tail_lowvar_unique_max = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_UNIQUE_MAX", "4"))
-            # Heuristic utterance-level duration cap when no EOS (0 disables)
-            max_ms_per_char_default = float(os.environ.get("CHATTERBOX_MAX_MS_PER_CHAR", "0"))
-            # Separate crop knobs for EOS vs no-EOS
+            # EOS-specific crop knob and text-cap options (the rest were computed above)
             eos_crop_k = int(os.environ.get("CHATTERBOX_EOS_CROP_TOKENS", "0"))
-            # Optional per-language overrides: CHATTERBOX_MAX_MS_PER_CHAR_EN, _HE, ...
-            max_ms_per_char_lang = []
-            for lang_id in language_ids:
-                key = f"CHATTERBOX_MAX_MS_PER_CHAR_{(lang_id or '').upper()}" if lang_id else None
-                if key and key in os.environ:
-                    try:
-                        max_ms_per_char_lang.append(float(os.environ[key]))
-                    except Exception:
-                        max_ms_per_char_lang.append(max_ms_per_char_default)
-                else:
-                    max_ms_per_char_lang.append(max_ms_per_char_default)
-
-            min_utter_ms_noeos = int(os.environ.get("CHATTERBOX_MIN_UTTER_MS_NOEOS", "0"))
-            extra_tail_noeos_ms = int(os.environ.get("CHATTERBOX_EXTRA_TAIL_NOEOS_MS", "150"))
-            # Text->token cap parameters (maps allowed ms to token count)
-            ms_per_token = float(os.environ.get("CHATTERBOX_MS_PER_TOKEN", "40"))  # default ~40ms/token
             margin_tokens_noeos = int(os.environ.get("CHATTERBOX_MARGIN_TOKENS_NOEOS", "6"))
             apply_txtcap_on_eos = os.environ.get("CHATTERBOX_TXTCAP_ON_EOS", "1").lower() in ("1","true","yes","on")
             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
@@ -668,17 +667,6 @@ class ChatterboxMultilingualTTS:
                                 tok_ids = tok_ids[:start]
                                 if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                                     print(f"[Tail][tok] after_lowvar_len={len(tok_ids)}")
-                        elif (not eos_found) and tail_lowvar_window > 0 and tail_lowvar_min > 0:
-                            # Fallback: low-variance tail detection when no EOS and no explicit run found.
-                            lv_len = min(len(tok_ids), tail_lowvar_window)
-                            window = tok_ids[-lv_len:]
-                            unique = len(set(window))
-                            if lv_len >= tail_lowvar_min and unique <= tail_lowvar_unique_max:
-                                start = len(tok_ids) - lv_len
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Tail][lowvar] truncating at start={start} len={lv_len} unique={unique} "
-                                          f"(uniq_max={tail_lowvar_unique_max})")
-                                tok_ids = tok_ids[:start]
 
                     # Text/tempo guided cap at token level (pre-S3Gen). Applies when no EOS, and optionally even when EOS.
                     if (not eos_found) or apply_txtcap_on_eos:
@@ -740,7 +728,7 @@ class ChatterboxMultilingualTTS:
                         print(f"[Tail][est] ms_per_token≈{est_ms_per_token:.2f} total_ms≈{ms_total:.1f} tokens={len(speech_tokens)} eos_found={eos_found}")
 
                     # Duration cap when no EOS: bound by characters and a per-char ms rate.
-                    if (not eos_found) and max_ms_per_char > 0 and wav is not None and wav.numel() > 0:
+                    if (not eos_found) and wav is not None and wav.numel() > 0:
                         sr = self.sr
                         dur_before_ms = int((wav.shape[1] * 1000.0) / sr)
                         try:
@@ -749,7 +737,7 @@ class ChatterboxMultilingualTTS:
                             chars = 0
                         mpc_i2 = max_ms_per_char_lang[i] if i < len(max_ms_per_char_lang) else max_ms_per_char_default
                         allowed_ms = int(max(min_utter_ms_noeos, chars * mpc_i2)) + int(extra_tail_noeos_ms)
-                        if dur_before_ms > allowed_ms:
+                        if allowed_ms > 0 and dur_before_ms > allowed_ms:
                             cut = min(wav.shape[1], int((allowed_ms / 1000.0) * sr))
                             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                                 print(f"[Tail][durcap] noeos: chars={chars} allowed_ms={allowed_ms} "
