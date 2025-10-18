@@ -377,6 +377,175 @@ class ChatterboxMultilingualTTS:
             *args, **kwargs
         )
 
+    def generate_tokens(
+        self,
+        prompts: Union[str, list[str]],
+        language_id: Optional[Union[str, list[str]]] = None,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        temperature: float = 0.4,
+        max_tokens=1000,
+        top_p=0.4,
+        repetition_penalty=2.0,
+        *args, **kwargs,
+    ) -> list[torch.Tensor]:
+        """
+        T3-only generation: returns vetted speech token sequences (1D tensors per prompt).
+        Mirrors sampling/clamping/EOS handling used by generate_with_conds so S3Gen renders
+        from identical token streams as full generation.
+        """
+        s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
+        return self.generate_tokens_with_conds(
+            prompts=prompts,
+            s3gen_ref=s3gen_ref,
+            cond_emb=cond_emb,
+            language_id=language_id,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            *args, **kwargs
+        )
+
+    def generate_tokens_with_conds(
+        self,
+        prompts: Union[str, list[str]],
+        s3gen_ref: dict[str, Any],
+        cond_emb: torch.Tensor,
+        language_id: Optional[Union[str, list[str]]] = None,
+        temperature: float = 0.4,
+        exaggeration: float = 0.5,
+        max_tokens=1000,
+        top_p=0.4,
+        repetition_penalty=2.0,
+        *args, **kwargs,
+    ) -> list[torch.Tensor]:
+        """
+        Same as generate_with_conds but stops after T3 token generation and returns the
+        final speech token tensors (post EOS handling and guards). No S3Gen decode here.
+        """
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        
+        # Handle language_id
+        if language_id is None:
+            language_ids = [None] * len(prompts)
+        elif isinstance(language_id, str):
+            language_ids = [language_id] * len(prompts)
+        else:
+            language_ids = language_id
+            if len(language_ids) != len(prompts):
+                raise ValueError(f"Number of language_ids ({len(language_ids)}) must match number of prompts ({len(prompts)})")
+
+        cond_emb = self.update_exaggeration(cond_emb, exaggeration)
+
+        # Norm and prepare text; pass language_id via tokenization kwargs to tokenizer
+        request_items = []
+        for p, lang_id in zip(prompts, language_ids):
+            normalized = punc_norm(p)
+            if lang_id:
+                text = f"[{lang_id.lower()}][START]{normalized}[STOP]"
+            else:
+                text = f"[START]{normalized}[STOP]"
+            item = {
+                "prompt": text,
+                "multi_modal_data": {
+                    "conditionals": [cond_emb],
+                },
+            }
+            if lang_id:
+                item["tokenization_kwargs"] = {"language_id": lang_id.lower()}
+            request_items.append(item)
+
+        with torch.inference_mode():
+            # Tail handling configuration (match generate_with_conds)
+            tail_crop_k = int(os.environ.get("CHATTERBOX_TAIL_CROP_TOKENS", "2"))
+
+            # Clamp sampling for multilingual stability when language_id is specified
+            temp_use = temperature
+            top_p_use = top_p
+            if any(language_ids):
+                temp_use = min(temperature, 0.5)
+                top_p_use = min(top_p, 0.5)
+            if os.environ.get("CHATTERBOX_DETERMINISTIC", "0").lower() in ("1","true","yes","on"):
+                temp_use = 0.0
+                top_p_use = 1.0
+
+            # Prepare stop token
+            stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
+
+            # Pre-generation per-prompt token cap (converted to a single batch max_tokens)
+            try:
+                tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "16"))
+                caps = []
+                for it in request_items:
+                    ptxt = it.get("prompt", "")
+                    pclean = re.sub(r"\[[^\]]+\]", "", ptxt)
+                    clen = sum(1 for c in pclean if not c.isspace())
+                    est = int(math.ceil(clen * tpc))
+                    est = max(tmin, min(tmax_env, est))
+                    gcap = int(math.ceil(est * guard_mult))
+                    caps.append(gcap)
+                if caps:
+                    pre_cap_tokens = max(1, min(caps) + max(0, pre_margin))
+                else:
+                    pre_cap_tokens = min(max_tokens, self.max_model_len)
+                pre_cap_tokens = min(pre_cap_tokens, min(max_tokens, self.max_model_len))
+            except Exception:
+                pre_cap_tokens = min(max_tokens, self.max_model_len)
+
+            batch_results = self.t3.generate(
+                request_items,
+                sampling_params=SamplingParams(
+                    temperature=temp_use,
+                    stop_token_ids=[stop_offset_id],
+                    max_tokens=pre_cap_tokens,
+                    top_p=top_p_use,
+                    repetition_penalty=repetition_penalty,
+                    *args, **kwargs,
+                )
+            )
+
+            results: list[torch.Tensor] = []
+            for i, batch_result in enumerate(batch_results):
+                for output in batch_result.outputs:
+                    # Truncate at first EOS (stop-of-speech) if present and crop tail tokens
+                    tok_ids = list(output.token_ids)
+                    if stop_offset_id in tok_ids:
+                        stop_idx = tok_ids.index(stop_offset_id)
+                        new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
+                        tok_ids = tok_ids[:new_end]
+                    # Map back to base speech token space
+                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
+                    speech_tokens = drop_invalid_tokens(speech_tokens)
+                    speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    # Dynamic overrun guard (match generate_with_conds)
+                    try:
+                        prompt_str = request_items[i].get("prompt", "")
+                        prompt_clean = re.sub(r"\[[^\]]+\]", "", prompt_str)
+                        char_len = sum(1 for c in prompt_clean if not c.isspace())
+                        tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                        tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                        tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                        guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                        est_tokens = int(math.ceil(char_len * tpc))
+                        est_tokens = max(tmin, min(tmax, est_tokens))
+                        guard_cap = int(math.ceil(est_tokens * guard_mult))
+                        n_tokens_cur = int(speech_tokens.shape[0]) if speech_tokens.ndim == 1 else int(speech_tokens.shape[1])
+                        if n_tokens_cur > guard_cap:
+                            speech_tokens = speech_tokens[:guard_cap]
+                    except Exception:
+                        pass
+
+                    results.append(speech_tokens.detach().cpu().contiguous().view(-1))
+            return results
+
     def generate_with_conds(
         self,
         prompts: Union[str, list[str]],
