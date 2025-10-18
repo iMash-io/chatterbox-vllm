@@ -152,7 +152,7 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
         return []
     # First split by strong punctuation (ASCII + common CJK/Arabic)
     import re
-    parts = re.split(r"([\.!\?;:\u2014\u2013。！？；，、،؛؟…])", text)
+    parts = re.split(r"([\.!\?;:。！？；，、،؛؟…])", text)
     # Re-join punctuation tokens
     assembled: List[str] = []
     cur = ""
