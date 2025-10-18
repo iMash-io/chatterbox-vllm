@@ -521,7 +521,6 @@ class ChatterboxMultilingualTTS:
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
                     logit_bias=logit_bias,
-                    *args, **kwargs,
                 )
             else:
                 sampling_params = SamplingParams(
@@ -531,7 +530,6 @@ class ChatterboxMultilingualTTS:
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
                     logit_bias=logit_bias,
-                    *args, **kwargs,
                 )
 
             batch_results = self.t3.generate(
