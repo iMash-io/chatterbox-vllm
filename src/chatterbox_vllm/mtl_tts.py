@@ -441,16 +441,28 @@ class ChatterboxMultilingualTTS:
             tail_trim_db = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB", "-42"))
             tail_trim_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_SAFETY_MS", "50"))
             tail_trim_eos_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_EOS_SAFETY_MS", "120"))
+            # New: enforce a minimum tail duration after last-active to avoid early cutoffs
+            tail_trim_min_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_MIN_MS", "0"))
+            tail_trim_min_eos_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_MIN_EOS_MS", "250"))
             rms_window_ms = int(os.environ.get("CHATTERBOX_RMS_WINDOW_MS", "50"))
             rms_hop_ms = int(os.environ.get("CHATTERBOX_RMS_HOP_MS", "20"))
             # Heuristic tail-run detection (repeated filler tokens near the end). Env-tunable.
             tail_run_tokens = set(int(x) for x in os.environ.get("CHATTERBOX_TAIL_RUN_TOKENS", "7486,7487").replace(" ", "").split(",") if x)
             tail_run_min = int(os.environ.get("CHATTERBOX_TAIL_RUN_MIN", "6"))
             tail_run_window = int(os.environ.get("CHATTERBOX_TAIL_RUN_WINDOW", "50"))
+            # New: when no EOS is emitted, use a larger search window to catch long gibberish runs
+            tail_run_window_noeos = int(os.environ.get("CHATTERBOX_TAIL_RUN_WINDOW_NOEOS", "200"))
+            # New: optional low-variance tail truncation when no EOS (disabled by default)
+            tail_lowvar_window = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_WINDOW", "0"))
+            tail_lowvar_min = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_MIN", "120"))
+            tail_lowvar_unique_max = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_UNIQUE_MAX", "4"))
             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                 print(f"[Tail] cfg: crop_k={tail_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
                       f"safety_ms={tail_trim_safety_ms} (+eos={tail_trim_eos_safety_ms}), win_ms={rms_window_ms}, hop_ms={rms_hop_ms}, "
-                      f"run_tokens={sorted(tail_run_tokens)}, run_min={tail_run_min}, run_window={tail_run_window}")
+                      f"run_tokens={sorted(tail_run_tokens)}, run_min={tail_run_min}, run_window={tail_run_window}, "
+                      f"run_window_noeos={tail_run_window_noeos}, lowvar_win={tail_lowvar_window}, "
+                      f"lowvar_min={tail_lowvar_min}, lowvar_uniq_max={tail_lowvar_unique_max}, "
+                      f"min_tail_ms={tail_trim_min_ms}, min_tail_eos_ms={tail_trim_min_eos_ms}")
 
             # Clamp sampling for multilingual stability when language_id is specified
             temp_use = temperature
@@ -545,8 +557,9 @@ class ChatterboxMultilingualTTS:
 
                     # Heuristic tail-run truncation: if a run of the same candidate token(s)
                     # appears near the end (e.g., 7486 repeated), cut to the start of that run.
-                    if len(tok_ids) > 0 and tail_run_window > 0 and tail_run_min > 0 and len(tail_run_tokens) > 0:
-                        look_len = min(len(tok_ids), tail_run_window)
+                    if len(tok_ids) > 0 and ((tail_run_window > 0) or (tail_run_window_noeos > 0)) and tail_run_min > 0 and len(tail_run_tokens) > 0:
+                        look_win = tail_run_window if eos_found else max(tail_run_window_noeos, tail_run_window)
+                        look_len = min(len(tok_ids), look_win)
                         look = tok_ids[-look_len:]
                         best_start = None
                         best_len = 0
@@ -569,6 +582,17 @@ class ChatterboxMultilingualTTS:
                                 print(f"[Tail][run] truncating at run_start={best_start} token={best_token} "
                                       f"run_len={best_len} window={look_len} preview_before={preview}")
                             tok_ids = tok_ids[:best_start]
+                        elif (not eos_found) and tail_lowvar_window > 0 and tail_lowvar_min > 0:
+                            # Fallback: low-variance tail detection when no EOS and no explicit run found.
+                            lv_len = min(len(tok_ids), tail_lowvar_window)
+                            window = tok_ids[-lv_len:]
+                            unique = len(set(window))
+                            if lv_len >= tail_lowvar_min and unique <= tail_lowvar_unique_max:
+                                start = len(tok_ids) - lv_len
+                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                    print(f"[Tail][lowvar] truncating at start={start} len={lv_len} unique={unique} "
+                                          f"(uniq_max={tail_lowvar_unique_max})")
+                                tok_ids = tok_ids[:start]
 
                     # Map back to base speech token space
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
@@ -604,14 +628,18 @@ class ChatterboxMultilingualTTS:
                             if active.numel() > 0:
                                 last_active = int(active[-1].item())
                                 safety_ms_eff = tail_trim_safety_ms + (tail_trim_eos_safety_ms if eos_found else 0)
+                                min_tail_ms_eff = tail_trim_min_ms + (tail_trim_min_eos_ms if eos_found else 0)
                                 safety = int(sr * safety_ms_eff / 1000)
-                                cut = min(wav.shape[1], (last_active + 1) * hop_len + safety)
+                                min_tail = int(sr * min_tail_ms_eff / 1000)
+                                cut_base = (last_active + 1) * hop_len + safety
+                                cut_floor = (last_active + 1) * hop_len + min_tail
+                                cut = min(wav.shape[1], max(cut_base, cut_floor))
                                 if cut < wav.shape[1]:
                                     if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                                         dur_after_ms = (cut * 1000.0) / sr
                                         print(f"[Tail][rms] trim: win={frame_len} hop={hop_len} thr={thr:.6f} "
                                               f"last_active_frame={last_active} safety={safety} "
-                                              f"(eos_found={eos_found}, safety_ms_eff={safety_ms_eff}) "
+                                              f"(eos_found={eos_found}, safety_ms_eff={safety_ms_eff}, min_tail_ms_eff={min_tail_ms_eff}) "
                                               f"dur_before_ms={dur_before_ms:.1f} -> dur_after_ms={dur_after_ms:.1f} "
                                               f"cut_samples={wav.shape[1]-cut}")
                                     wav = wav[:, :cut]
