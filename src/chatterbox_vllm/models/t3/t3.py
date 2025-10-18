@@ -736,6 +736,16 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         padding = torch.full((logits.shape[0], SPEECH_TOKEN_OFFSET), float('-inf'), 
                              dtype=logits.dtype, device=logits.device)
         logits = torch.cat([padding, logits], dim=1)
+
+        # Tier B: optional model-level EOS bias to reduce premature stopping
+        try:
+            eos_bias_model = os.environ.get("CHATTERBOX_EOS_LOGIT_BIAS_MODEL", None)
+            if eos_bias_model is not None and str(eos_bias_model).strip() != "":
+                eos_idx = SPEECH_TOKEN_OFFSET + self.t3conf.stop_speech_token
+                logits[:, eos_idx] = logits[:, eos_idx] + float(eos_bias_model)
+        except Exception:
+            pass
+
         return logits
 
 
