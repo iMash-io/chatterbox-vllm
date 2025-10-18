@@ -259,6 +259,11 @@ class ChatterboxMultilingualTTS:
             "vocab_size": 8
         }
         
+        # Optionally force attention weights for analyzer (tradeoff: slower than SDPA)
+        if os.environ.get("CHATTERBOX_ALIGN_ATTNS", "0").lower() in ("1","true","yes","on"):
+            config["attn_implementation"] = "eager"
+            config["output_attentions"] = True
+            print("[MTL] Forcing attn_implementation=eager with output_attentions=True for alignment analyzer")
         # Write config.json
         with open(model_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)

@@ -187,6 +187,30 @@ class ChatterboxTTS:
         except Exception as _e:
             print(f"[TTS][WARN] Failed to copy tokenizer.json: {_e}")
 
+        # Optionally force attention weights for analyzer (tradeoff: slower than SDPA)
+        # vLLM reads config.json from the model dir. When enabled, prefer eager attention with attentions on.
+        try:
+            if os.environ.get("CHATTERBOX_ALIGN_ATTNS", "0").lower() in ("1", "true", "yes", "on"):
+                cfg_path = Path.cwd() / "t3-model" / "config.json"
+                cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                cfg = {}
+                if cfg_path.exists():
+                    try:
+                        import json as _json
+                        with open(cfg_path, "r") as f:
+                            cfg = _json.load(f)
+                    except Exception:
+                        cfg = {}
+                # Update/insert keys
+                cfg["attn_implementation"] = "eager"
+                cfg["output_attentions"] = True
+                # Write back
+                import json as _json
+                with open(cfg_path, "w") as f:
+                    _json.dump(cfg, f, indent=2)
+                print("[EN] Forcing attn_implementation=eager with output_attentions=True for alignment analyzer")
+        except Exception as _e:
+            print(f"[EN][WARN] Failed to patch t3-model/config.json for attentions: {_e}")
         return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
 
     @classmethod

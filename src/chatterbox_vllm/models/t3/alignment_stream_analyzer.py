@@ -82,6 +82,11 @@ class AlignmentStreamAnalyzer:
 
         # Fallback tail counter when using similarity-based alignment
         self.tail_frames: int = 0
+        # Monotonic smoothed position for fallback alignment
+        self.pos_smooth: int = 0
+        # Stagnation detection: track if pos_smooth stops advancing
+        self.last_pos_smooth: int = 0
+        self.stagnant_frames: int = 0
 
         # Forward hooks to capture attentions for a few heads
         self.last_aligned_attns = []
@@ -148,32 +153,59 @@ class AlignmentStreamAnalyzer:
                 # Fallback: estimate alignment via cosine similarity to prefill text embeddings if available
                 if (self.text_embeds_norm is not None) and (hidden_state is not None):
                     try:
+                        # Normalize current hidden state (last vector of current step)
                         h = hidden_state
                         if isinstance(h, torch.Tensor) and h.ndim > 1:
                             h = h[-1]
                         h = F.normalize(h.detach().float(), dim=-1).cpu()
-                        sims = torch.matmul(self.text_embeds_norm, h.unsqueeze(-1)).squeeze(-1)  # (S,)
-                        cur_text_posn = int(torch.argmax(sims).item())
+                        # Cosine similarities to text embeddings (S,)
+                        sims = torch.matmul(self.text_embeds_norm, h.unsqueeze(-1)).squeeze(-1)
                         S = int(self.text_embeds_norm.shape[0])
-                        if (os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")):
-                            try:
-                                print(f"[Align][fallback] pos={cur_text_posn}/{S-1} started={self.started} complete={self.complete} tail_frames={self.tail_frames}")
-                            except Exception:
-                                pass
-                        # Update position/complete tracking
-                        discontinuity = not (-4 < cur_text_posn - self.text_position < 7)
-                        if not discontinuity:
-                            self.text_position = cur_text_posn
-                        self.complete = self.complete or (self.text_position >= S - 3 if S > 0 else False)
-                        if self.complete:
+                        # Soft alignment with temperature (more stable than argmax)
+                        tau = 2.0
+                        p = torch.softmax(sims / tau, dim=-1)
+                        pos_exp = float(torch.sum(p * torch.arange(S, dtype=p.dtype)))
+                        pos_raw = int(max(0, min(S - 1, round(pos_exp))))
+                        # Monotonic smoothing: allow limited forward speed, never go backwards
+                        max_step = 2  # frames can advance up to 2 text positions per step
+                        next_pos = min(S - 1, max(self.pos_smooth, min(pos_raw, self.pos_smooth + max_step)))
+                        self.pos_smooth = next_pos
+                        # Stagnation detection
+                        if self.pos_smooth > self.last_pos_smooth:
+                            self.stagnant_frames = 0
+                            self.last_pos_smooth = self.pos_smooth
+                        else:
+                            self.stagnant_frames += 1
+                        # Mark started after a few frames or once we leave pos 0
+                        if (not self.started) and (self.curr_frame_pos >= 2 or self.pos_smooth >= 1):
+                            self.started = True
+                            self.started_at = self.started_at or self.curr_frame_pos
+                        # Completion/tail logic based on smoothed position
+                        if (S > 0) and (self.pos_smooth >= S - 2):
+                            if not self.complete:
+                                self.complete = True
+                                self.completed_at = self.curr_frame_pos
                             self.tail_frames += 1
-                        # Early EOS suppression while far from end
-                        if (cur_text_posn < (S - 3)) and (S > 5):
+                        # Early EOS suppression while far from end; add safety valve vs run-on
+                        safety_disable = (self.curr_frame_pos >= (S + 10))
+                        stagnate_disable = (self.stagnant_frames >= max(8, S // 2))  # ~160ms or half text length tokens
+                        if (self.pos_smooth < (S - 2)) and (S > 5) and (not safety_disable) and (not stagnate_disable):
                             logits[..., self.eos_idx] = -2**15
-                        # Simple long-tail cutoff if we've been complete for enough frames
+                            action_dbg = "suppress_eos"
+                        else:
+                            action_dbg = "none"
+                        # Force EOS if we've stayed complete for ~200-240ms (12 frames @20ms)
                         if self.complete and self.tail_frames >= 12:
                             logits[..., :] = -(2**15)
                             logits[..., self.eos_idx] = 2**15
+                            action_dbg = "force_eos"
+                        if (os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")):
+                            try:
+                                print(f"[Align][fallback] frame={self.curr_frame_pos} pos_raw={pos_raw}/{S-1} pos_smooth={self.pos_smooth} "
+                                      f"started={self.started} complete={self.complete} tail={self.tail_frames} stagnant={self.stagnant_frames} "
+                                      f"safety_disable={safety_disable} action={action_dbg}")
+                            except Exception:
+                                pass
                     except Exception:
                         # Minimal early-EOS safety for the very first frames
                         if self.curr_frame_pos < 2:
