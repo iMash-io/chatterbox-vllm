@@ -63,6 +63,11 @@ The package should automatically download the correct model weights from the Hug
 
 If you encounter CUDA issues, try resetting the venv and using `uv pip install -e .` instead of `uv sync`.
 
+
+# Updating
+
+If you are updating from a previous version, run `uv sync` to update the dependencies. The package will automatically download the correct model weights from the Hugging Face Hub.
+
 # Example
 
 [This example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts.py) can be run with `python example-tts.py` to generate audio samples for three different prompts using three different voices.
@@ -92,6 +97,15 @@ if __name__ == "__main__":
         for audio_idx, audio in enumerate(audios):
             ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
 ```
+
+# Multilingual
+
+An early version of Multilingual support is available (see [this example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts-multilingual.py)). However there *are* quality degradations compared to the original model, driven by:
+* Alignment Stream Analyzer is not implemented, which can result in errors, repetitions, and extra noise at the end of the audio snippet.
+* The lack of learned speech positional encodings is also much more noticible.
+* Russian text stress is not yet implemented.
+
+For the list of supported languages, see [here](https://github.com/resemble-ai/chatterbox?tab=readme-ov-file#supported-languages).
 
 # Benchmarks
 
@@ -230,6 +244,12 @@ vLLM does not support CFG natively, so substantial hacks were needed to make it 
 </div>
 
 # Changelog
+
+## `0.2.1`
+* Updated to multilingual v2
+
+## `0.2.0`
+* Initial multilingual support.
 
 ## `0.1.5`
 * Fix Python packaging missing the tokenizer.json file
