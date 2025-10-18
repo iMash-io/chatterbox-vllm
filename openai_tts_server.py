@@ -52,8 +52,11 @@ Environment Variables:
   - CHATTERBOX_USE_LOCAL_CKPT: path to local checkpoint dir (else uses HF from_pretrained)
   - CHATTERBOX_WARMUP_TEXT: text to use for warmup (default: "Hello")
   - CHATTERBOX_WARMUP_DIFF_STEPS: int diffusion steps for warmup (default: 2)
-  - CHATTERBOX_STREAM_CROSSFADE_MS: crossfade length in ms for stitching between streamed chunks (default: 40)
-  - CHATTERBOX_STREAM_LEADING_TRIM_MS: leading trim in ms removed from the head of each subsequent chunk (default: 60)
+  - CHATTERBOX_STREAM_CROSSFADE_MS: crossfade length in ms for stitching between streamed chunks (default: 60)
+  - CHATTERBOX_STREAM_LEADING_TRIM_MS: leading trim in ms removed from the head of each subsequent chunk (default: 80)
+  - CHATTERBOX_STREAM_CONTEXT_WORDS: number of trailing words from the previous chunk to prepend as context to the next chunk (default: 3)
+  - CHATTERBOX_STREAM_TOKEN_RATE: estimated S3 token rate (tokens/sec) for mapping text length to time (default: 25)
+  - CHATTERBOX_STREAM_VOWEL_TRIM_MS: extra leading trim (ms) when next chunk begins with a vowel onset (default: 20)
 """
 
 import os
@@ -206,10 +209,10 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
             if not s: return False
             # strip trailing punctuation/quotes/dashes
             t = s.rstrip().rstrip("”’'\"—-) ")
-            # if ends with strong punctuation, do not merge
-            if t and t[-1] in ".!?;:":
-                return False
-            words = t.split()
+            # Allow merge even if strong punctuation was appended by normalization.
+            # Inspect the last lexical token without trailing punctuation.
+            t_no_punc = t.rstrip(".!?;:")
+            words = t_no_punc.split()
             return len(words) > 0 and words[-1].lower().strip("“’'\"(") in NONBREAK_END_WORDS
 
         def _starts_with_word(s: str) -> bool:
@@ -225,6 +228,8 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
                 next_chunk = cleaned[i+1]
                 next_words = next_chunk.split()
                 moved = 0
+                # Drop trailing strong punctuation on the left chunk so we don't mid-sentence terminate.
+                cur_chunk = cur_chunk.rstrip().rstrip(".!?;:")
                 # Try to attach up to 2 words if it fits max_chars
                 while next_words and moved < 2:
                     candidate = (cur_chunk + " " + next_words[0]).strip()
@@ -234,7 +239,21 @@ def _split_text_for_low_latency(text: str, max_chars: int = 120) -> List[str]:
                         moved += 1
                     else:
                         break
-                cleaned[i+1] = " ".join(next_words).strip()
+                # If we could not attach any word due to max_chars, move the dangling non-breaker to the next chunk
+                if moved == 0:
+                    cur_words = cur_chunk.split()
+                    if cur_words:
+                        nb = cur_words[-1]
+                        # Only move if it is indeed a non-breaker (extra safety)
+                        if nb.lower() in NONBREAK_END_WORDS:
+                            cur_chunk = " ".join(cur_words[:-1]).strip()
+                            cleaned[i+1] = (nb + " " + " ".join(next_words).strip()).strip()
+                        else:
+                            cleaned[i+1] = " ".join(next_words).strip()
+                    else:
+                        cleaned[i+1] = " ".join(next_words).strip()
+                else:
+                    cleaned[i+1] = " ".join(next_words).strip()
                 # If we consumed all of the next chunk, skip it
                 if cleaned[i+1] == "":
                     i += 1
@@ -317,8 +336,21 @@ def _crossfade(a_tail: torch.Tensor, b_head: torch.Tensor, ms: int, sr: int) -> 
         return b_head
     a = a_tail[:, -use:]
     b = b_head[:, :use]
-    ramp = torch.linspace(0.0, 1.0, steps=use, dtype=a.dtype, device=a.device).unsqueeze(0)
-    return a * (1.0 - ramp) + b * ramp
+    # Remove DC components and match RMS of b to a to reduce timbre/energy jump
+    eps = 1e-8
+    a_mean = a.mean(dim=1, keepdim=True)
+    b_mean = b.mean(dim=1, keepdim=True)
+    a0 = a - a_mean
+    b0 = b - b_mean
+    a_rms = torch.sqrt(torch.clamp((a0 ** 2).mean(dim=1, keepdim=True), min=eps))
+    b_rms = torch.sqrt(torch.clamp((b0 ** 2).mean(dim=1, keepdim=True), min=eps))
+    scale = torch.clamp(a_rms / b_rms, 0.5, 2.0)  # avoid extreme jumps
+    b0 = b0 * scale
+    # Equal-power crossfade (perceptually smoother)
+    t = torch.linspace(0.0, math.pi / 2.0, steps=use, dtype=a.dtype, device=a.device).unsqueeze(0)
+    wa = torch.cos(t) ** 2  # weight for a
+    wb = torch.sin(t) ** 2  # weight for b
+    return a0 * wa + b0 * wb
 
 
 # ---------- Core synthesis helpers ----------
@@ -477,8 +509,12 @@ async def _synthesize_streaming_pcm_frames(
         return
 
     # Dynamic audio stitching knobs
-    crossfade_ms = int(os.environ.get("CHATTERBOX_STREAM_CROSSFADE_MS", "40"))
-    leading_trim_ms = int(os.environ.get("CHATTERBOX_STREAM_LEADING_TRIM_MS", "60"))
+    crossfade_ms = int(os.environ.get("CHATTERBOX_STREAM_CROSSFADE_MS", "60"))
+    leading_trim_ms = int(os.environ.get("CHATTERBOX_STREAM_LEADING_TRIM_MS", "80"))
+    context_words = int(os.environ.get("CHATTERBOX_STREAM_CONTEXT_WORDS", "3"))
+    token_rate = float(os.environ.get("CHATTERBOX_STREAM_TOKEN_RATE", "25"))
+    tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+    vowel_trim_ms = int(os.environ.get("CHATTERBOX_STREAM_VOWEL_TRIM_MS", "20"))
     hold_ms = max(0, crossfade_ms)
     hold_samples = int(sr * hold_ms / 1000)
 
@@ -490,10 +526,18 @@ async def _synthesize_streaming_pcm_frames(
         if idx == 0 and first_chunk_diff_steps is not None:
             steps = max(1, int(first_chunk_diff_steps))
 
+        # Prepare context-prepended synthesis text (improves prosody continuity)
+        context_str = ""
+        if idx > 0 and context_words > 0:
+            prev_words = chunks[idx - 1].split()
+            ctx_words = prev_words[-context_words:] if len(prev_words) >= context_words else prev_words
+            context_str = " ".join(ctx_words).strip()
+        synth_text = (context_str + " " + chunk).strip() if context_str else chunk
+
         # Heavy compute dispatched to thread to not block event loop
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
-            chunk,
+            synth_text,
             language_id=language_id,
             temperature=temperature,
             exaggeration=exaggeration,
@@ -533,8 +577,27 @@ async def _synthesize_streaming_pcm_frames(
                 prev_tail = None
             continue
 
-        # Subsequent chunks: trim head to remove vocoder onset artifacts, then crossfade with previous tail
-        cur = _trim_head_ms(wav, leading_trim_ms, sr)
+        # Subsequent chunks: trim head to remove vocoder onset artifacts and skip context audio, then crossfade
+        trim_ms = leading_trim_ms
+        if context_str:
+            # Estimate time for the prepended context using char length -> tokens -> time mapping
+            ctx_chars = sum(1 for c in context_str if not c.isspace())
+            try:
+                ctx_ms_est = int(round(1000.0 * ((ctx_chars * tpc) / max(1e-6, token_rate))))
+                trim_ms = max(trim_ms, ctx_ms_est)
+            except Exception:
+                pass
+        # Add extra trim when the chunk begins with a vowel (onset artifacts are more audible on vowels)
+        try:
+            import re
+            m = re.search(r"[A-Za-z]", chunk)
+            if m:
+                first_alpha = chunk[m.start()].lower()
+                if first_alpha in "aeiou":
+                    trim_ms = max(trim_ms, leading_trim_ms + vowel_trim_ms)
+        except Exception:
+            pass
+        cur = _trim_head_ms(wav, trim_ms, sr)
 
         if prev_tail is not None and prev_tail.numel() > 0 and cur is not None and cur.numel() > 0:
             # Determine overlap length actually available
@@ -552,7 +615,7 @@ async def _synthesize_streaming_pcm_frames(
 
             # Crossfade the overlapping region
             head = cur[:, :overlap]
-            xfade = _crossfade(prev_tail, head, ms=crossfade_ms if overlap == hold_samples else int(1000 * overlap / sr), sr=sr)
+            xfade = _crossfade(prev_tail, head, ms=int(1000 * overlap / sr), sr=sr)
             if xfade is not None and xfade.numel() > 0:
                 pcm_bytes = _float32_to_pcm16_bytes(xfade)
                 for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
@@ -731,7 +794,7 @@ async def create_speech(req: SpeechRequest):
                 watermark=req.watermark or "off",
                 primer_silence_ms=req.primer_silence_ms or 0,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 3),
-                first_chunk_chars=req.first_chunk_chars or 30,
+                first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
             ),
