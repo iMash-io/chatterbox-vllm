@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
-import os
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -15,7 +14,7 @@ from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
-from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
 from .models.t3 import SPEECH_TOKEN_OFFSET
@@ -134,19 +133,13 @@ class ChatterboxTTS:
             "max_model_len": max_model_len,
         }
 
-        # Optional: prefer FlashAttention 2 in vLLM if available
-        if os.environ.get("CHATTERBOX_FA2", "0").lower() in ("1","true","yes","on"):
-            os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTENTION_2")
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print("[T3] Requesting FLASH_ATTENTION_2 backend via env")
-
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
         ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
         ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16, use_compile=compile)
+        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
         s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
@@ -343,22 +336,20 @@ class ChatterboxTTS:
                 )
             )
             t3_gen_time = time.time() - start_time
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
-            # run torch gc (opt-in; default off to avoid CUDA sync)
-            if os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
-                torch.cuda.empty_cache()
+            # run torch gc
+            torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
             for i, batch_result in enumerate(batch_results):
                 for output in batch_result.outputs:
-                    if i % 5 == 0 and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    if i % 5 == 0:
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
-                    # Run gc every 10 prompts (opt-in; default off)
-                    if i % 10 == 0 and os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
+                    # Run gc every 10 prompts
+                    if i % 10 == 0:
                         torch.cuda.empty_cache()
 
                     speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
@@ -370,45 +361,9 @@ class ChatterboxTTS:
                         ref_dict=s3gen_ref,
                         n_timesteps=diffusion_steps,
                     )
-
-                    # Optional deterministic token-to-time alignment based on fixed token rate (25 tok/sec)
-                    try:
-                        n_tokens = int(speech_tokens.shape[1]) if speech_tokens.ndim > 1 else int(speech_tokens.numel())
-                    except Exception:
-                        n_tokens = int(speech_tokens.numel())
-                    expected_samples = int(round(n_tokens * (self.sr / S3_TOKEN_RATE)))
-                    align_on = os.environ.get("CHATTERBOX_ALIGN_HARD", "1").lower() in ("1","true","yes","on")
-                    align_safety_ms = int(os.environ.get("CHATTERBOX_ALIGN_SAFETY_MS", "0"))
-                    align_safety = max(0, int(self.sr * align_safety_ms / 1000))
-                    if align_on and wav is not None and wav.numel() > 0:
-                        cap = min(wav.shape[1], expected_samples + align_safety)
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[Align][en] tokens={n_tokens} expected_samples={expected_samples} safety={align_safety} cap={cap} wav_in={wav.shape[1]}")
-                        wav = wav[:, :cap]
-
-                    # Optional time stretch to expected length (quality trade-off; disabled by default)
-                    # If WAV is shorter than expected, upsample linearly to target length to avoid over-fast playback.
-                    if os.environ.get("CHATTERBOX_STRETCH_TO_EXPECTED", "0").lower() in ("1","true","yes","on"):
-                        try:
-                            cur_len = int(wav.shape[1])
-                            target_len = max(cur_len, expected_samples)
-                            if target_len > 0 and target_len != cur_len:
-                                wav = torch.nn.functional.interpolate(
-                                    wav.unsqueeze(1), size=target_len, mode="linear", align_corners=False
-                                ).squeeze(1)
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Stretch][en] stretched wav from {cur_len} -> {target_len}")
-                        except Exception as _e:
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                print(f"[Stretch][en] skipped due to error: {_e}")
-
-                    if os.environ.get("CHATTERBOX_KEEP_ON_DEVICE", "0").lower() in ("1","true","yes","on"):
-                        results.append(wav)
-                    else:
-                        results.append(wav.cpu())
+                    results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
         

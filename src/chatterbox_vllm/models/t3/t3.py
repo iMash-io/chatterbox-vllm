@@ -153,7 +153,7 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             except Exception as _e:
                 print(f"[T3Processor][_call_hf_processor] debug error: {_e}")
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
-        if processed_outputs['conditionals'] is not None and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+        if processed_outputs['conditionals'] is not None:
             print("processed_outputs", processed_outputs['conditionals'].shape)
         return processed_outputs
 
@@ -214,11 +214,9 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
                 prompt_ids = [pid for pid in prompt_ids if pid != 2]
                 after_len = len(prompt_ids)
                 if before_len != after_len:
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
+                    print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
         except Exception as _e:
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"t3/apply: sanitize prompt_ids failed: {_e}")
+            print(f"t3/apply: sanitize prompt_ids failed: {_e}")
 
         # We are going to apply custom logic to squish the embeddings in the right format.
         # The final embedding will look like <| cond | text | speech |>
@@ -341,8 +339,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.logits_processor = LogitsProcessor(self.t3conf.speech_tokens_dict_size)
 
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            print("Applying CFG scale:", self.cfg_scale)
+        print("Applying CFG scale:", self.cfg_scale)
 
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -501,19 +498,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
     ) -> torch.Tensor:
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
-            # Safe decode: only offset tokens that are >= SPEECH_TOKEN_OFFSET.
-            # Any token < SPEECH_TOKEN_OFFSET (e.g., stray prefill markers during vLLM profiling)
-            # is mapped to start_speech_token to avoid out-of-range embedding indices.
-            safe_ids = input_ids
-            if not torch.is_floating_point(safe_ids):
-                safe_ids = safe_ids.to(torch.long)
-            safe_ids = torch.where(
-                safe_ids >= SPEECH_TOKEN_OFFSET,
-                safe_ids - SPEECH_TOKEN_OFFSET,
-                torch.full_like(safe_ids, self.t3conf.start_speech_token),
-            )
-            safe_ids = torch.clamp(safe_ids, 0, self.t3conf.speech_tokens_dict_size - 1)
-            embeds = self.speech_emb(safe_ids)
+            # Remember to undo the offset we applied to the speech tokens.
+            embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
 
             out = torch.cat([embeds, embeds], dim=1)
 
@@ -534,17 +520,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
                 if multimodal_embedding is None:
                     # There's no multimodal embeddings, so we're decoding.
-                    # Safe decode: only offset tokens that are >= SPEECH_TOKEN_OFFSET.
-                    safe_ids = ids
-                    if not torch.is_floating_point(safe_ids):
-                        safe_ids = safe_ids.to(torch.long)
-                    safe_ids = torch.where(
-                        safe_ids >= SPEECH_TOKEN_OFFSET,
-                        safe_ids - SPEECH_TOKEN_OFFSET,
-                        torch.full_like(safe_ids, self.t3conf.start_speech_token),
-                    )
-                    safe_ids = torch.clamp(safe_ids, 0, self.t3conf.speech_tokens_dict_size - 1)
-                    embeds = self.speech_emb(safe_ids)
+                    # Remember to undo the offset we applied to the speech tokens.
+                    embeds = self.speech_emb(ids - SPEECH_TOKEN_OFFSET)
                     final_embeds = torch.cat([embeds, embeds], dim=1)
                     # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                     
@@ -729,8 +706,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     # print("t3/get_input_embeddings/fallback: returning zero embeds for stray block")
                     return zeros
                 except Exception as _e:
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"t3/get_input_embeddings/fallback failed: {_e}")
+                    print(f"t3/get_input_embeddings/fallback failed: {_e}")
                     raise
 
             output = torch.cat(out, dim=0)
@@ -785,42 +761,17 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         # TODO: Apply speech positional embeddings here
 
-        # Some attention backends (e.g., FlashAttention 2) can be sensitive to the
-        # sequence-doubling trick (concatenating along the sequence dimension).
-        # Provide a two-pass fallback that runs the transformer once per CFG branch
-        # and then concatenates along the hidden dimension, preserving API expectations.
-        backend = os.environ.get("VLLM_ATTENTION_BACKEND", "").upper()
-        cfg_twopass = os.environ.get("CHATTERBOX_CFG_TWOPASS", "0").lower() in ("1","true","yes","on")
-        use_two_pass = cfg_twopass or backend == "FLASH_ATTENTION_2"
+        hidden_states = self.tfmr(
+            input_ids=None,
+            positions=torch.cat([positions, positions], dim=0),
+            intermediate_tensors=None,
+            inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0)
+        )
+        # print("t3/hidden_states", hidden_states.shape, hidden_states.dtype)
 
-        if use_two_pass:
-            # Run two passes to avoid sequence-doubling issues
-            hs_cond = self.tfmr(
-                input_ids=None,
-                positions=positions.contiguous(),
-                intermediate_tensors=None,
-                inputs_embeds=cond_embeds.contiguous()
-            )
-            hs_uncond = self.tfmr(
-                input_ids=None,
-                positions=positions.contiguous(),
-                intermediate_tensors=None,
-                inputs_embeds=uncond_embeds.contiguous()
-            )
-            # Concatenate along hidden dimension to form [seq_len, 2*dim]
-            hidden_states = torch.cat([hs_cond, hs_uncond], dim=1)
-            return hidden_states
-        else:
-            # Original single-pass trick: concatenate along sequence dimension and split back
-            hidden_states = self.tfmr(
-                input_ids=None,
-                positions=torch.cat([positions, positions], dim=0).contiguous(),
-                intermediate_tensors=None,
-                inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0).contiguous()
-            )
-            # Reconcatenate the hidden states into the master tensor
-            hidden_state_1, hidden_state_2 = hidden_states.split([len(cond_embeds), len(uncond_embeds)], dim=0)
-            return torch.cat([hidden_state_1, hidden_state_2], dim=1)
+        # Reconcatenate the hidden states into the master tensor
+        hidden_state_1, hidden_state_2 = hidden_states.split([len(cond_embeds), len(uncond_embeds)], dim=0)
+        return torch.cat([hidden_state_1, hidden_state_2], dim=1)
 
     def get_language_model(self) -> torch.nn.Module:
         return self.tfmr

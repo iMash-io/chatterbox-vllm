@@ -155,8 +155,7 @@ class ChatterboxMultilingualTTS:
         vllm_memory_needed = (1.55*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 128)
         vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
 
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+        print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
         base_vllm_kwargs = {
             "model": "./t3-multilingual-model",
@@ -168,19 +167,13 @@ class ChatterboxMultilingualTTS:
             "max_model_len": max_model_len,
         }
 
-        # Optional: prefer FlashAttention 2 in vLLM if available
-        if os.environ.get("CHATTERBOX_FA2", "0").lower() in ("1","true","yes","on"):
-            os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTENTION_2")
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print("[T3] Requesting FLASH_ATTENTION_2 backend via env")
-
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
         ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", weights_only=True))
         ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16, use_compile=compile)
+        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
         s3gen.load_state_dict(torch.load(ckpt_dir / "s3gen.pt", weights_only=True), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
@@ -522,22 +515,20 @@ class ChatterboxMultilingualTTS:
                 )
             )
             t3_gen_time = time.time() - start_time
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
+            print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
-            # run torch gc (opt-in; default off to avoid CUDA sync)
-            if os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
-                torch.cuda.empty_cache()
+            # run torch gc
+            torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
             for i, batch_result in enumerate(batch_results):
                 for output in batch_result.outputs:
-                    if i % 5 == 0 and os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    if i % 5 == 0:
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
-                    # Run gc every 10 prompts (opt-in; default off)
-                    if i % 10 == 0 and os.environ.get("CHATTERBOX_EMPTY_CACHE", "0").lower() in ("1","true","yes","on"):
+                    # Run gc every 10 prompts
+                    if i % 10 == 0:
                         torch.cuda.empty_cache()
 
                     # Truncate at the first emitted stop-of-speech token if present
@@ -665,13 +656,9 @@ class ChatterboxMultilingualTTS:
                         except Exception:
                             pass
 
-                    if os.environ.get("CHATTERBOX_KEEP_ON_DEVICE", "0").lower() in ("1","true","yes","on"):
-                        results.append(wav)
-                    else:
-                        results.append(wav.cpu())
+                    results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
         
