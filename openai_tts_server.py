@@ -75,7 +75,6 @@ from pydantic import BaseModel, Field
 
 from chatterbox_vllm.tts import ChatterboxTTS
 from chatterbox_vllm.mtl_tts import ChatterboxMultilingualTTS
-from chatterbox_vllm.models.s3tokenizer import S3_TOKEN_RATE
 
 
 APP = FastAPI(title="OpenAI-compatible TTS for chatterbox-vllm")
@@ -111,12 +110,6 @@ class SpeechRequest(BaseModel):
     first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
     chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
-    holdback_ms: Optional[int] = Field(default=40, ge=0, le=120, description="Do not emit the latest N ms yet; avoids boundary re-synthesis artifacts")
-    flush_ms: Optional[int] = Field(default=80, ge=10, le=500, description="Target additional audio duration to flush each progressive render")
-    align_safety_ms: Optional[int] = Field(default=0, ge=0, le=40, description="Extra alignment safety on top of token→time mapping")
-    first_window_tokens: Optional[int] = Field(default=None, ge=1, le=512, description="Tokens to include in the very first render window (fallback: env CHATTERBOX_FIRST_WINDOW_TOKENS or derived from flush_ms)")
-    stream_window_tokens: Optional[int] = Field(default=None, ge=1, le=512, description="Tokens to add on subsequent progressive renders (fallback: env CHATTERBOX_STREAM_WINDOW_TOKENS or derived from flush_ms)")
-    stream_overlap_tokens: Optional[int] = Field(default=0, ge=0, le=128, description="Token overlap between successive renders; advance = stream_window_tokens - overlap (fallback: env CHATTERBOX_STREAM_OVERLAP_TOKENS)")
 
 
 # ---------- Utilities ----------
@@ -322,132 +315,100 @@ async def _synthesize_streaming_pcm_frames(
     watermark: str,
     primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
-    first_chunk_chars: int = 60,   # ignored in progressive mode
-    chunk_chars: int = 120,        # ignored in progressive mode
+    first_chunk_chars: int = 60,
+    chunk_chars: int = 120,
     frame_ms: int = 20,
-    holdback_ms: int = 40,
-    flush_ms: int = 80,
-    align_safety_ms: int = 0,
-    first_window_tokens: Optional[int] = None,
-    stream_window_tokens: Optional[int] = None,
-    stream_overlap_tokens: Optional[int] = None,
 ) -> Generator[bytes, None, None]:
     """
-    Progressive streaming with stability frontier (language/model agnostic):
-
-    1) Generate the COMPLETE speech-token sequence once with T3 (vLLM).
-    2) Progressively re-render longer prefixes with S3Gen.
-    3) At each render, emit ONLY the strictly new, stable part:
-         safe_cut = expected_samples(prefix_tokens) - holdback_samples
-       This guarantees no overlap and no re-synth seam artifacts.
-    4) On the final pass, emit the remainder (no holdback).
-
-    This yields real-time PCM frames as soon as safe samples exist.
+    Streaming generator:
+      - Split text into chunks (~sentences/phrases)
+      - Synthesize first chunk quickly (optional reduced diffusion steps)
+      - Convert to PCM16 and yield small frames immediately
+      - Continue with subsequent chunks (full quality)
     """
     tts = _ensure_engine()
     sr = tts.sr
 
-    # Optional primer silence to flush HTTP headers immediately
+    # For multilingual engine, avoid per-chunk prefill to prevent tokenizer/block mismatch.
+    # Generate full utterance once, then stream PCM frames.
+    if isinstance(tts, ChatterboxMultilingualTTS):
+        wav: torch.Tensor = await asyncio.to_thread(
+            _synthesize_one,
+            text,
+            language_id=language_id,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            diffusion_steps=diffusion_steps,
+            audio_prompt_path=audio_prompt_path,
+        )
+        wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
+        pcm_bytes = _float32_to_pcm16_bytes(wav)
+        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
+            if not frame:
+                continue
+            yield frame
+        return
+
+    # Optional primer silence to flush headers immediately and force chunked streaming
     if primer_silence_ms and primer_silence_ms > 0:
         n_samples = int(sr * primer_silence_ms / 1000)
         if n_samples > 0:
             primer = torch.zeros(1, n_samples, dtype=torch.float32, device="cpu")
             yield _float32_to_pcm16_bytes(primer)
+            # Hint the event loop to flush headers and first bytes immediately
             await asyncio.sleep(0)
 
-    # 1) Prepare conditionals once and generate full token stream (fast; vLLM)
-    #    Use token-only API to ensure identical tokenization/CFG as non-streaming.
-    def _gen_tokens() -> torch.Tensor:
-        toks_list = tts.generate_tokens(
-            prompts=text,
+    # Build chunks: small first chunk, larger subsequent chunks
+    chunks: List[str] = []
+    if first_chunk_chars and first_chunk_chars > 0:
+        fchunks = _split_text_for_low_latency(text, max_chars=first_chunk_chars)
+        if fchunks:
+            first_text = fchunks[0]
+            chunks.append(first_text)
+            remaining = text[len(first_text):].strip()
+            if remaining:
+                chunks.extend(_split_text_for_low_latency(remaining, max_chars=chunk_chars))
+    else:
+        chunks = _split_text_for_low_latency(text, max_chars=chunk_chars)
+
+    if not chunks:
+        return
+
+    for idx, chunk in enumerate(chunks):
+        # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
+        steps = diffusion_steps
+        if idx == 0 and first_chunk_diff_steps is not None:
+            steps = max(1, int(first_chunk_diff_steps))
+
+        # Heavy compute dispatched to thread to not block event loop
+        wav: torch.Tensor = await asyncio.to_thread(
+            _synthesize_one,
+            chunk,
             language_id=language_id,
-            audio_prompt_path=audio_prompt_path,
             temperature=temperature,
             exaggeration=exaggeration,
-            max_tokens=tts.max_model_len,
+            diffusion_steps=steps,
+            audio_prompt_path=audio_prompt_path,
         )
-        if not toks_list:
-            raise RuntimeError("No tokens generated")
-        return toks_list[0]
 
-    # Get S3Gen reference dict once (cached) so all renders use same conditioning
-    s3gen_ref, _cond = tts.get_audio_conditionals(audio_prompt_path)
+        # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
+        fade_ms = 5
+        fade_samples = int(sr * fade_ms / 1000)
+        if wav.numel() > fade_samples and fade_samples > 0:
+            tail = wav[:, -fade_samples:]
+            ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
+            tail_faded = tail * ramp
+            wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
 
-    tokens_1d: torch.Tensor = await asyncio.to_thread(_gen_tokens)
-    total_tokens: int = int(tokens_1d.numel())
+        # Watermark policy (off = no modification)
+        wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokens_1d = tokens_1d.to(device=device, dtype=torch.long)
-
-    samples_per_token = sr / float(S3_TOKEN_RATE)
-    def tokens_to_samples(n_tok: int) -> int:
-        return int(round(n_tok * samples_per_token))
-
-    # Token window sizing (env overrides supported) for continuous progressive streaming.
-    # We incrementally extend the rendered prefix to keep audio flowing until completion.
-    step_tokens = max(1, int(round(S3_TOKEN_RATE * (flush_ms / 1000.0))))
-    env_first = int(os.environ.get("CHATTERBOX_FIRST_WINDOW_TOKENS", "0") or "0")
-    env_stream = int(os.environ.get("CHATTERBOX_STREAM_WINDOW_TOKENS", "0") or "0")
-    env_overlap = int(os.environ.get("CHATTERBOX_STREAM_OVERLAP_TOKENS", "0") or "0")
-
-    first_tokens = first_window_tokens if (first_window_tokens and first_window_tokens > 0) else (env_first if env_first > 0 else max(step_tokens, 24))
-    stream_tokens = stream_window_tokens if (stream_window_tokens and stream_window_tokens > 0) else (env_stream if env_stream > 0 else step_tokens)
-    overlap_tokens = stream_overlap_tokens if (stream_overlap_tokens is not None) else env_overlap
-    overlap_tokens = max(0, int(overlap_tokens))
-    advance_tokens = max(1, int(stream_tokens) - overlap_tokens)
-
-    holdback_samples = max(0, int(round(sr * (holdback_ms / 1000.0))))
-    align_safety = max(0, int(round(sr * (align_safety_ms / 1000.0))))
-
-    last_emitted = 0
-
-    def _render_prefix(n_tok: int, steps: int) -> torch.Tensor:
-        tok_prefix = tokens_1d[:n_tok]
-        if tok_prefix.numel() == 0:
-            return torch.zeros(1, 0, dtype=torch.float32, device="cpu")
-        wav, _ = tts.s3gen.inference(
-            speech_tokens=tok_prefix,
-            ref_dict=s3gen_ref,
-            n_timesteps=max(1, int(steps)),
-        )
-        return wav
-
-    # Progressive loop: keep extending the prefix and streaming the newly stable region.
-    cur_tokens = first_tokens
-    first_done = False
-    while True:
-        cur_tokens = min(cur_tokens, total_tokens)
-        steps_use = (first_chunk_diff_steps if (not first_done and first_chunk_diff_steps is not None) else diffusion_steps)
-
-        wav: torch.Tensor = await asyncio.to_thread(_render_prefix, cur_tokens, steps_use)
-
-        # Alignment cap by expected samples from token count (+ optional safety)
-        cap = min(wav.shape[1], tokens_to_samples(cur_tokens) + align_safety)
-
-        # Stability frontier: on non-final passes do not emit the latest holdback region
-        if cur_tokens < total_tokens:
-            safe_cut = max(0, cap - holdback_samples)
-        else:
-            safe_cut = cap
-
-        if safe_cut > last_emitted:
-            chunk = wav[:, last_emitted:safe_cut].to("cpu")
-            pcm_bytes = _float32_to_pcm16_bytes(chunk)
-            for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
-                if not frame:
-                    continue
-                yield frame
-            last_emitted = safe_cut
-
-        first_done = True
-        if cur_tokens >= total_tokens:
-            break
-
-        # advance window (may overlap for better stability if configured)
-        cur_tokens += advance_tokens
-
-    # Done
-    await asyncio.sleep(0)
+        # To PCM16 and then to 40ms-ish frames
+        pcm_bytes = _float32_to_pcm16_bytes(wav)
+        for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
+            if not frame:
+                continue
+            yield frame
 
 
 # ---------- FastAPI lifecycle ----------
@@ -556,11 +517,8 @@ async def create_speech(req: SpeechRequest):
     if req.stream:
         stream_headers = {
             "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache, no-store, must-revalidate, no-transform",
+            "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "keep-alive",
-            "Accept-Ranges": "none",
         }
         return StreamingResponse(
             _synthesize_streaming_pcm_frames(
@@ -576,12 +534,6 @@ async def create_speech(req: SpeechRequest):
                 first_chunk_chars=req.first_chunk_chars or 60,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
-                holdback_ms=req.holdback_ms or 40,
-                flush_ms=req.flush_ms or 80,
-                align_safety_ms=req.align_safety_ms or 0,
-                first_window_tokens=req.first_window_tokens,
-                stream_window_tokens=req.stream_window_tokens,
-                stream_overlap_tokens=req.stream_overlap_tokens,
             ),
             media_type=f"audio/pcm;rate={tts.sr};channels=1",
             headers=stream_headers,
