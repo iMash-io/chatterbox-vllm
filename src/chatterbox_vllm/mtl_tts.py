@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
 import os
-import math
 
 from vllm import LLM, SamplingParams
 from functools import lru_cache
@@ -319,11 +318,11 @@ class ChatterboxMultilingualTTS:
         language_id: Optional[Union[str, list[str]]] = None,
         audio_prompt_path: Optional[str] = None,
         exaggeration: float = 0.5,
-        temperature: float = 0.4,
+        temperature: float = 0.8,
         max_tokens=1000, # Capped at max_model_len
 
         # From original Chatterbox HF generation args
-        top_p=0.4,
+        top_p=0.8,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
@@ -382,7 +381,7 @@ class ChatterboxMultilingualTTS:
         s3gen_ref: dict[str, Any],
         cond_emb: torch.Tensor,
         language_id: Optional[Union[str, list[str]]] = None,
-        temperature: float = 0.4,
+        temperature: float = 0.8,
         exaggeration: float = 0.5,
         max_tokens=1000, # Capped at max_model_len
 
@@ -392,7 +391,7 @@ class ChatterboxMultilingualTTS:
         diffusion_steps: int = 10,
 
         # From original Chatterbox HF generation args
-        top_p=0.4,
+        top_p=0.8,
         repetition_penalty=2.0,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
@@ -415,10 +414,8 @@ class ChatterboxMultilingualTTS:
 
         # Norm and prepare text; pass language_id via tokenization kwargs to tokenizer
         request_items = []
-        normalized_texts = []
         for p, lang_id in zip(prompts, language_ids):
             normalized = punc_norm(p)
-            normalized_texts.append(normalized)
             # Explicitly inject language tag to ensure correct language routing end-to-end.
             if lang_id:
                 text = f"[{lang_id.lower()}][START]{normalized}[STOP]"
@@ -435,133 +432,17 @@ class ChatterboxMultilingualTTS:
                 item["tokenization_kwargs"] = {"language_id": lang_id.lower()}
             request_items.append(item)
 
-        # Text length -> target token budget (for tighter alignment)
-        tokens_per_char_default = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "6.0"))
-        tokens_per_char_lang = []
-        for lang_id in language_ids:
-            key = f"CHATTERBOX_TOKENS_PER_CHAR_{(lang_id or '').upper()}" if lang_id else None
-            if key and key in os.environ:
-                try:
-                    tokens_per_char_lang.append(float(os.environ[key]))
-                except Exception:
-                    tokens_per_char_lang.append(tokens_per_char_default)
-            else:
-                tokens_per_char_lang.append(tokens_per_char_default)
-        txtlen_sampling_margin = int(os.environ.get("CHATTERBOX_TXTLEN_SAMPLING_MARGIN_TOKENS", "24"))
-        enable_txtlen_sampling_max = os.environ.get("CHATTERBOX_ENABLE_TXTLEN_SAMPLING_MAX", "1").lower() in ("1","true","yes","on")
-
-        # Precompute per-language ms-per-char and time budgets BEFORE computing SamplingParams
-        max_ms_per_char_default = float(os.environ.get("CHATTERBOX_MAX_MS_PER_CHAR", "0"))
-        max_ms_per_char_lang = []
-        for lang_id in language_ids:
-            key = f"CHATTERBOX_MAX_MS_PER_CHAR_{(lang_id or '').upper()}" if lang_id else None
-            if key and key in os.environ:
-                try:
-                    max_ms_per_char_lang.append(float(os.environ[key]))
-                except Exception:
-                    max_ms_per_char_lang.append(max_ms_per_char_default)
-            else:
-                max_ms_per_char_lang.append(max_ms_per_char_default)
-        # These are used to convert allowed ms to token budgets
-        min_utter_ms_noeos = int(os.environ.get("CHATTERBOX_MIN_UTTER_MS_NOEOS", "0"))
-        extra_tail_noeos_ms = int(os.environ.get("CHATTERBOX_EXTRA_TAIL_NOEOS_MS", "150"))
-        ms_per_token = float(os.environ.get("CHATTERBOX_MS_PER_TOKEN", "40"))
-
-        char_counts = [len(t) for t in normalized_texts]
-        tokens_limit_texts = [int(math.ceil(c * tpc)) for c, tpc in zip(char_counts, tokens_per_char_lang)] if normalized_texts else []
-        allowed_tokens_time_items = [int(math.ceil((max(min_utter_ms_noeos, c * mpc) + extra_tail_noeos_ms) / ms_per_token)) for c, mpc in zip(char_counts, max_ms_per_char_lang)] if normalized_texts else []
-        tokens_budget_items = []
-        for idx in range(len(char_counts)):
-            b_len = tokens_limit_texts[idx] if idx < len(tokens_limit_texts) else None
-            b_time = allowed_tokens_time_items[idx] if idx < len(allowed_tokens_time_items) else None
-            if isinstance(b_len, int) and isinstance(b_time, int):
-                tokens_budget_items.append(min(b_len, b_time))
-            elif isinstance(b_len, int):
-                tokens_budget_items.append(b_len)
-            elif isinstance(b_time, int):
-                tokens_budget_items.append(b_time)
-            else:
-                tokens_budget_items.append(max_tokens)
-        # Single SamplingParams for the batch -> use max of per-item budgets plus margin
-        sp_max_tokens = min(self.max_model_len, min(max_tokens, (max(tokens_budget_items) + txtlen_sampling_margin) if (enable_txtlen_sampling_max and tokens_budget_items) else max_tokens))
-
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            print(f"[T3][txtlen] chars={char_counts} tpc={tokens_per_char_lang} txt_caps={tokens_limit_texts} "
-                  f"mpc={max_ms_per_char_lang} time_caps={allowed_tokens_time_items} budgets={tokens_budget_items} "
-                  f"sampling_margin={txtlen_sampling_margin} sp_max_tokens={sp_max_tokens} enable={enable_txtlen_sampling_max}")
-
         with torch.inference_mode():
             start_time = time.time()
-
-            # Tail handling configuration (env-tunable)
-            tail_crop_k = int(os.environ.get("CHATTERBOX_TAIL_CROP_TOKENS", "2"))
-            tail_trim_on = os.environ.get("CHATTERBOX_TAIL_TRIM", "1").lower() in ("1","true","yes","on")
-            tail_trim_db = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB", "-42"))
-            tail_trim_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_SAFETY_MS", "50"))
-            tail_trim_eos_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_EOS_SAFETY_MS", "120"))
-            # New: enforce a minimum tail duration after last-active to avoid early cutoffs
-            tail_trim_min_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_MIN_MS", "0"))
-            tail_trim_min_eos_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_MIN_EOS_MS", "250"))
-            rms_window_ms = int(os.environ.get("CHATTERBOX_RMS_WINDOW_MS", "50"))
-            rms_hop_ms = int(os.environ.get("CHATTERBOX_RMS_HOP_MS", "20"))
-            # Heuristic tail-run detection (repeated filler tokens near the end). Env-tunable.
-            tail_run_tokens = set(int(x) for x in os.environ.get("CHATTERBOX_TAIL_RUN_TOKENS", "7486,7487").replace(" ", "").split(",") if x)
-            tail_run_min = int(os.environ.get("CHATTERBOX_TAIL_RUN_MIN", "6"))
-            tail_run_window = int(os.environ.get("CHATTERBOX_TAIL_RUN_WINDOW", "50"))
-            # New: when no EOS is emitted, use a larger search window to catch long gibberish runs
-            tail_run_window_noeos = int(os.environ.get("CHATTERBOX_TAIL_RUN_WINDOW_NOEOS", "200"))
-            # New: optional low-variance tail truncation when no EOS (disabled by default)
-            tail_lowvar_window = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_WINDOW", "0"))
-            tail_lowvar_min = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_MIN", "120"))
-            tail_lowvar_unique_max = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_UNIQUE_MAX", "4"))
-            # EOS-specific crop knob and text-cap options (the rest were computed above)
-            eos_crop_k = int(os.environ.get("CHATTERBOX_EOS_CROP_TOKENS", "0"))
-            margin_tokens_noeos = int(os.environ.get("CHATTERBOX_MARGIN_TOKENS_NOEOS", "6"))
-            apply_txtcap_on_eos = os.environ.get("CHATTERBOX_TXTCAP_ON_EOS", "1").lower() in ("1","true","yes","on")
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[Tail] cfg: crop_k={tail_crop_k}, eos_crop_k={eos_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
-                      f"safety_ms={tail_trim_safety_ms} (+eos={tail_trim_eos_safety_ms}), win_ms={rms_window_ms}, hop_ms={rms_hop_ms}, "
-                      f"run_tokens={sorted(tail_run_tokens)}, run_min={tail_run_min}, run_window={tail_run_window}, "
-                      f"run_window_noeos={tail_run_window_noeos}, lowvar_win={tail_lowvar_window}, "
-                      f"lowvar_min={tail_lowvar_min}, lowvar_uniq_max={tail_lowvar_unique_max}, "
-                      f"min_tail_ms={tail_trim_min_ms}, min_tail_eos_ms={tail_trim_min_eos_ms}")
-                print(f"[Tail] durcap: max_ms_per_char_default={max_ms_per_char_default}, per_lang={max_ms_per_char_lang}, "
-                      f"min_utter_ms_noeos={min_utter_ms_noeos}, extra_tail_noeos_ms={extra_tail_noeos_ms}")
-                print(f"[Tail] txtcap: ms_per_token={ms_per_token}, margin_tokens_noeos={margin_tokens_noeos}")
-
-            # Clamp sampling for multilingual stability when language_id is specified
-            temp_use = temperature
-            top_p_use = top_p
-            rep_use = repetition_penalty
-            top_k_use = int(os.environ.get("CHATTERBOX_TOP_K", "0"))  # 0=disabled
-            if any(language_ids):
-                temp_use = min(temperature, 0.5)
-                top_p_use = min(top_p, 0.5)
-                # Slightly stronger repetition penalty for multilingual to reduce rambling
-                rep_use = max(repetition_penalty, 2.2)
-                # Default to a modest top-k for stability if not provided
-                if top_k_use == 0:
-                    top_k_use = 40
-                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[T3] Clamped multilingual sampling: temperature={temp_use}, top_p={top_p_use}, "
-                          f"repetition_penalty={rep_use}, top_k={top_k_use}")
-
-            # Prepare stop token for logging
-            stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
-            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                print(f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
-                      f"max_tokens={sp_max_tokens}, stop_token_ids={[stop_offset_id]}")
-
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
-                    temperature=temp_use,
+                    temperature=temperature,
 
-                    stop_token_ids=[stop_offset_id],
-                    max_tokens=sp_max_tokens,
-                    top_p=top_p_use,
-                    top_k=top_k_use,
-                    repetition_penalty=rep_use,
+                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                    max_tokens=min(max_tokens, self.max_model_len),
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
 
                     *args, **kwargs,
                 )
@@ -583,203 +464,15 @@ class ChatterboxMultilingualTTS:
                     if i % 10 == 0:
                         torch.cuda.empty_cache()
 
-                    # Truncate at the first emitted stop-of-speech token if present
-                    stop_offset_id = self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET
-                    tok_ids = list(output.token_ids)
-                    eos_found = False
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[Tail][tok] stage0_len={len(tok_ids)}")
-
-                    # Debug: summarize EOS behavior
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        finish_reason = getattr(output, "finish_reason", None)
-                        stop_positions = [idx for idx, t in enumerate(tok_ids) if t == stop_offset_id]
-                        head = tok_ids[:10]
-                        tail = tok_ids[-10:]
-                        print(f"[T3][eos] finish_reason={finish_reason}, out_len={len(tok_ids)}, "
-                              f"stop_found={len(stop_positions)>0}, first_stop_idx={stop_positions[0] if stop_positions else None}, "
-                              f"head={head}, tail={tail}")
-
-                    if stop_offset_id in tok_ids:
-                        stop_idx = tok_ids.index(stop_offset_id)
-                        eos_found = True
-                        # Adaptive token-tail crop: only drop K tokens if tail shows candidate run tokens
-                        tail_seg_start = max(0, stop_idx - min(tail_run_window, stop_idx))
-                        tail_segment = tok_ids[tail_seg_start:stop_idx]
-                        has_run_token = any(t in tail_run_tokens for t in tail_segment)
-                        eff_k = int(eos_crop_k) if has_run_token else 0
-                        new_end = max(0, stop_idx - max(0, eff_k))
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            removed = len(tok_ids) - new_end
-                            tail_preview = tok_ids[max(0, new_end-10):new_end]
-                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
-                                  f"crop_k_eff={eff_k} (has_run_token={has_run_token}), new_end={new_end}, "
-                                  f"removed={removed}, tail_before_crop={tail_preview}")
-                        tok_ids = tok_ids[:new_end]
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[Tail][tok] after_eos_cut_len={len(tok_ids)}")
-                    else:
-                        # If no EOS, note whether we hit max_tokens
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            hit_max = len(tok_ids) >= min(max_tokens, self.max_model_len)
-                            print(f"[T3][eos] no stop token emitted; hit_max_tokens={hit_max}")
-
-                    # Heuristic tail-run truncation: if a run of the same candidate token(s)
-                    # appears near the end (e.g., 7486 repeated), cut to the start of that run.
-                    # NOTE: Only apply when no EOS was emitted to avoid premature cutting.
-                    if (not eos_found) and len(tok_ids) > 0 and ((tail_run_window > 0) or (tail_run_window_noeos > 0)) and tail_run_min > 0 and len(tail_run_tokens) > 0:
-                        look_win = tail_run_window if eos_found else max(tail_run_window_noeos, tail_run_window)
-                        look_len = min(len(tok_ids), look_win)
-                        look = tok_ids[-look_len:]
-                        best_start = None
-                        best_len = 0
-                        best_token = None
-                        cur_len = 0
-                        for idx, t in enumerate(look):
-                            if idx == 0 or t != look[idx - 1]:
-                                cur_len = 1
-                            else:
-                                cur_len += 1
-                            if cur_len >= tail_run_min and t in tail_run_tokens:
-                                start = len(tok_ids) - look_len + idx - cur_len + 1
-                                best_start = start
-                                best_len = cur_len
-                                best_token = t
-                                break  # first occurrence closest to the end is enough
-                        if best_start is not None and best_start < len(tok_ids):
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                preview = tok_ids[max(0, best_start - 10):best_start]
-                                print(f"[Tail][run] truncating at run_start={best_start} token={best_token} "
-                                      f"run_len={best_len} window={look_len} preview_before={preview}")
-                            tok_ids = tok_ids[:best_start]
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                print(f"[Tail][tok] after_tailrun_len={len(tok_ids)}")
-                        elif (not eos_found) and tail_lowvar_window > 0 and tail_lowvar_min > 0:
-                            # Fallback: low-variance tail detection when no EOS and no explicit run found.
-                            lv_len = min(len(tok_ids), tail_lowvar_window)
-                            window = tok_ids[-lv_len:]
-                            unique = len(set(window))
-                            if lv_len >= tail_lowvar_min and unique <= tail_lowvar_unique_max:
-                                start = len(tok_ids) - lv_len
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Tail][lowvar] truncating at start={start} len={lv_len} unique={unique} "
-                                          f"(uniq_max={tail_lowvar_unique_max})")
-                                tok_ids = tok_ids[:start]
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Tail][tok] after_lowvar_len={len(tok_ids)}")
-
-                    # Text/tempo guided cap at token level (pre-S3Gen). Applies when no EOS, and optionally even when EOS.
-                    if (not eos_found) or apply_txtcap_on_eos:
-                        try:
-                            chars = len(normalized_texts[i]) if i < len(normalized_texts) else 0
-                        except Exception:
-                            chars = 0
-                        # Time-based allowance in tokens from per-char ms rate
-                        allowed_tokens_time = None
-                        if max_ms_per_char_default > 0 and ms_per_token > 0:
-                            mpc_i = max_ms_per_char_lang[i] if i < len(max_ms_per_char_lang) else max_ms_per_char_default
-                            allowed_ms_txt = int(max(min_utter_ms_noeos, chars * mpc_i)) + int(extra_tail_noeos_ms)
-                            allowed_tokens_time = int(math.ceil(allowed_ms_txt / ms_per_token)) + max(0, margin_tokens_noeos)
-                        # Length-based allowance in tokens from tokens-per-char
-                        allowed_tokens_len = None
-                        if 'tokens_limit_texts' in locals() and i < len(tokens_limit_texts):
-                            allowed_tokens_len = tokens_limit_texts[i] + max(0, margin_tokens_noeos)
-
-                        # Select the most conservative cap
-                        candidates = [v for v in [allowed_tokens_time, allowed_tokens_len] if isinstance(v, int)]
-                        if candidates:
-                            cap_tokens = min(candidates)
-                            if len(tok_ids) > cap_tokens:
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Tail][txtcap] {'eos' if eos_found else 'noeos'}: chars={chars} "
-                                          f"cap_tokens={cap_tokens} "
-                                          f"(time={allowed_tokens_time} len={allowed_tokens_len}) "
-                                          f"old_len={len(tok_ids)} new_len={cap_tokens}")
-                                tok_ids = tok_ids[:cap_tokens]
-                                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                    print(f"[Tail][tok] after_txtcap_len={len(tok_ids)}")
-
-                    # Map back to base speech token space
-                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in tok_ids], device="cuda")
+                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
-
-                    # Hard cap on speech token length as a final guard (env-tunable)
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[Tail][tok] before_s3_tokens_len={len(speech_tokens)}")
-                    max_speech_cap = int(os.environ.get("CHATTERBOX_MAX_SPEECH_TOKENS", "0"))
-                    if max_speech_cap > 0 and len(speech_tokens) > max_speech_cap:
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[Tail][cap] truncating speech tokens from {len(speech_tokens)} to {max_speech_cap}")
-                        speech_tokens = speech_tokens[:max_speech_cap]
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[Tail][tok] after_tokens_cap_len={len(speech_tokens)}")
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,
                         ref_dict=s3gen_ref,
                         n_timesteps=diffusion_steps,
                     )
-                    # Estimate ms/token to correlate token-level crops with audio duration
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on") and wav is not None and wav.numel() > 0 and len(speech_tokens) > 0:
-                        sr = self.sr
-                        ms_total = (wav.shape[1] * 1000.0) / sr
-                        est_ms_per_token = ms_total / max(1, len(speech_tokens))
-                        print(f"[Tail][est] ms_per_token≈{est_ms_per_token:.2f} total_ms≈{ms_total:.1f} tokens={len(speech_tokens)} eos_found={eos_found}")
-
-                    # Duration cap when no EOS: bound by characters and a per-char ms rate.
-                    if (not eos_found) and wav is not None and wav.numel() > 0:
-                        sr = self.sr
-                        dur_before_ms = int((wav.shape[1] * 1000.0) / sr)
-                        try:
-                            chars = len(normalized_texts[i]) if i < len(normalized_texts) else 0
-                        except Exception:
-                            chars = 0
-                        mpc_i2 = max_ms_per_char_lang[i] if i < len(max_ms_per_char_lang) else max_ms_per_char_default
-                        allowed_ms = int(max(min_utter_ms_noeos, chars * mpc_i2)) + int(extra_tail_noeos_ms)
-                        if allowed_ms > 0 and dur_before_ms > allowed_ms:
-                            cut = min(wav.shape[1], int((allowed_ms / 1000.0) * sr))
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                print(f"[Tail][durcap] noeos: chars={chars} allowed_ms={allowed_ms} "
-                                      f"dur_before_ms={dur_before_ms} -> dur_after_ms={allowed_ms} "
-                                      f"cut_samples={wav.shape[1]-cut}")
-                            wav = wav[:, :cut]
-
-                    # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
-                    if tail_trim_on and wav is not None and wav.numel() > 0:
-                        sr = self.sr
-                        dur_before_ms = (wav.shape[1] * 1000.0) / sr
-                        frame_len = max(1, int(sr * rms_window_ms / 1000))
-                        hop_len = max(1, int(sr * rms_hop_ms / 1000))
-                        if wav.shape[1] >= frame_len:
-                            x2 = (wav.unsqueeze(0) ** 2)  # (1, 1, T) after conv1d reshape below
-                            x2 = x2 if x2.ndim == 3 else x2.view(1, 1, -1)
-                            kernel = torch.ones(1, 1, frame_len, device=wav.device, dtype=wav.dtype) / frame_len
-                            rms = torch.sqrt(torch.nn.functional.conv1d(x2, kernel, stride=hop_len)).squeeze()
-                            thr = 10.0 ** (tail_trim_db / 20.0)
-                            active = torch.where(rms > thr)[0]
-                            if active.numel() > 0:
-                                last_active = int(active[-1].item())
-                                safety_ms_eff = tail_trim_safety_ms + (tail_trim_eos_safety_ms if eos_found else 0)
-                                min_tail_ms_eff = tail_trim_min_ms + (tail_trim_min_eos_ms if eos_found else 0)
-                                safety = int(sr * safety_ms_eff / 1000)
-                                min_tail = int(sr * min_tail_ms_eff / 1000)
-                                cut_base = (last_active + 1) * hop_len + safety
-                                cut_floor = (last_active + 1) * hop_len + min_tail
-                                cut = min(wav.shape[1], max(cut_base, cut_floor))
-                                if cut < wav.shape[1]:
-                                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                        dur_after_ms = (cut * 1000.0) / sr
-                                        print(f"[Tail][rms] trim: win={frame_len} hop={hop_len} thr={thr:.6f} "
-                                              f"last_active_frame={last_active} safety={safety} "
-                                              f"(eos_found={eos_found}, safety_ms_eff={safety_ms_eff}, min_tail_ms_eff={min_tail_ms_eff}) "
-                                              f"dur_before_ms={dur_before_ms:.1f} -> dur_after_ms={dur_after_ms:.1f} "
-                                              f"cut_samples={wav.shape[1]-cut}")
-                                    wav = wav[:, :cut]
-                        else:
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                print(f"[Tail][rms] skip: wav too short for frame_len={frame_len} (len={wav.shape[1]})")
-
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")

@@ -280,13 +280,12 @@ def _synthesize_one(
             language_id = autodetect
 
     # For multilingual vLLM path, ensure special tokens aren't altered by tokenizer settings.
-    # Do NOT ignore EOS: allow decoder to stop on speech stop token.
     extra_sampling_kwargs = {}
     if isinstance(tts, ChatterboxMultilingualTTS):
         extra_sampling_kwargs = {
             "spaces_between_special_tokens": False,
             "skip_special_tokens": False,
-            "ignore_eos": False,
+            "ignore_eos": True,
         }
 
     waves = tts.generate(
@@ -472,7 +471,7 @@ async def _startup() -> None:
             warm_extra_sampling_kwargs = {
                 "spaces_between_special_tokens": False,
                 "skip_special_tokens": False,
-                "ignore_eos": False,
+                "ignore_eos": True,
             }
 
         _ = _tts_engine.generate(
