@@ -414,8 +414,10 @@ class ChatterboxMultilingualTTS:
 
         # Norm and prepare text; pass language_id via tokenization kwargs to tokenizer
         request_items = []
+        normalized_texts = []
         for p, lang_id in zip(prompts, language_ids):
             normalized = punc_norm(p)
+            normalized_texts.append(normalized)
             # Explicitly inject language tag to ensure correct language routing end-to-end.
             if lang_id:
                 text = f"[{lang_id.lower()}][START]{normalized}[STOP]"
@@ -456,6 +458,10 @@ class ChatterboxMultilingualTTS:
             tail_lowvar_window = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_WINDOW", "0"))
             tail_lowvar_min = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_MIN", "120"))
             tail_lowvar_unique_max = int(os.environ.get("CHATTERBOX_TAIL_LOWVAR_UNIQUE_MAX", "4"))
+            # Heuristic utterance-level duration cap when no EOS (0 disables)
+            max_ms_per_char = float(os.environ.get("CHATTERBOX_MAX_MS_PER_CHAR", "0"))
+            min_utter_ms_noeos = int(os.environ.get("CHATTERBOX_MIN_UTTER_MS_NOEOS", "0"))
+            extra_tail_noeos_ms = int(os.environ.get("CHATTERBOX_EXTRA_TAIL_NOEOS_MS", "150"))
             if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
                 print(f"[Tail] cfg: crop_k={tail_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
                       f"safety_ms={tail_trim_safety_ms} (+eos={tail_trim_eos_safety_ms}), win_ms={rms_window_ms}, hop_ms={rms_hop_ms}, "
@@ -463,6 +469,7 @@ class ChatterboxMultilingualTTS:
                       f"run_window_noeos={tail_run_window_noeos}, lowvar_win={tail_lowvar_window}, "
                       f"lowvar_min={tail_lowvar_min}, lowvar_uniq_max={tail_lowvar_unique_max}, "
                       f"min_tail_ms={tail_trim_min_ms}, min_tail_eos_ms={tail_trim_min_eos_ms}")
+                print(f"[Tail] durcap: max_ms_per_char={max_ms_per_char}, min_utter_ms_noeos={min_utter_ms_noeos}, extra_tail_noeos_ms={extra_tail_noeos_ms}")
 
             # Clamp sampling for multilingual stability when language_id is specified
             temp_use = temperature
@@ -557,7 +564,8 @@ class ChatterboxMultilingualTTS:
 
                     # Heuristic tail-run truncation: if a run of the same candidate token(s)
                     # appears near the end (e.g., 7486 repeated), cut to the start of that run.
-                    if len(tok_ids) > 0 and ((tail_run_window > 0) or (tail_run_window_noeos > 0)) and tail_run_min > 0 and len(tail_run_tokens) > 0:
+                    # NOTE: Only apply when no EOS was emitted to avoid premature cutting.
+                    if (not eos_found) and len(tok_ids) > 0 and ((tail_run_window > 0) or (tail_run_window_noeos > 0)) and tail_run_min > 0 and len(tail_run_tokens) > 0:
                         look_win = tail_run_window if eos_found else max(tail_run_window_noeos, tail_run_window)
                         look_len = min(len(tok_ids), look_win)
                         look = tok_ids[-look_len:]
@@ -611,6 +619,23 @@ class ChatterboxMultilingualTTS:
                         ref_dict=s3gen_ref,
                         n_timesteps=diffusion_steps,
                     )
+
+                    # Duration cap when no EOS: bound by characters and a per-char ms rate.
+                    if (not eos_found) and max_ms_per_char > 0 and wav is not None and wav.numel() > 0:
+                        sr = self.sr
+                        dur_before_ms = int((wav.shape[1] * 1000.0) / sr)
+                        try:
+                            chars = len(normalized_texts[i]) if i < len(normalized_texts) else 0
+                        except Exception:
+                            chars = 0
+                        allowed_ms = int(max(min_utter_ms_noeos, chars * max_ms_per_char)) + int(extra_tail_noeos_ms)
+                        if dur_before_ms > allowed_ms:
+                            cut = min(wav.shape[1], int((allowed_ms / 1000.0) * sr))
+                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                                print(f"[Tail][durcap] noeos: chars={chars} allowed_ms={allowed_ms} "
+                                      f"dur_before_ms={dur_before_ms} -> dur_after_ms={allowed_ms} "
+                                      f"cut_samples={wav.shape[1]-cut}")
+                            wav = wav[:, :cut]
 
                     # Energy-based tail trim (RMS) to remove residual low-energy artifacts at the end
                     if tail_trim_on and wav is not None and wav.numel() > 0:
