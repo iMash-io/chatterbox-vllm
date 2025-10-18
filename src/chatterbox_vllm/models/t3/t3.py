@@ -267,7 +267,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # Initialize LLaMA backbone
         self.tfmr = LlamaModel(vllm_config=vllm_config, prefix=prefix + ".tfmr")
 
-        text_tokens_dict_size = 704 if self.cfg.tokenizer == "EnTokenizer" else 2352
+        text_tokens_dict_size = 704 if self.cfg.tokenizer == "EnTokenizer" else 2454
 
         # Initialize custom components
         self.t3conf = T3Config()

@@ -98,7 +98,7 @@ class ChatterboxTTS:
         t3_config = T3Config()
 
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_23lang.safetensors"))
+        t3_weights = load_file(ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"))
 
         t3_enc = T3CondEnc(t3_config)
         t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
@@ -172,13 +172,13 @@ class ChatterboxTTS:
     @classmethod
     def from_pretrained_multilingual(cls,
                                     repo_id: str = REPO_ID,
-                                    revision: str = "c819eeccdf99310da26bca3bc5ace120db93471a",
+                                    revision: str = "05e904af2b5c7f8e482687a9d7336c5c824467d9",
                                     *args, **kwargs) -> 'ChatterboxTTS':
-        for fpath in ["ve.safetensors", "t3_23lang.safetensors", "s3gen.safetensors", "mtl_tokenizer.json", "conds.pt", "Cangjie5_TC.json"]:
+        for fpath in ["ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
         # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_23lang.safetensors"
+        t3_cfg_path = Path(local_path).parent / "t3_mtl23ls_v2.safetensors"
         model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)

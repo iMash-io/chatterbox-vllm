@@ -3,9 +3,8 @@ import os
 from typing import List, Optional, Union
 from pathlib import Path
 import json
-from unicodedata import category
+from unicodedata import category, normalize
 
-import torch
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizer
 from huggingface_hub import hf_hub_download
@@ -27,6 +26,7 @@ REPO_ID = "ResembleAI/chatterbox"
 # Global instances for optional dependencies
 # _kakasi = None
 _dicta = None
+_russian_stresser = None
 
 
 def is_kanji(c: str) -> bool:
@@ -118,7 +118,7 @@ class ChineseCangjieConverter:
     def _init_segmenter(self):
         """Initialize pkuseg segmenter."""
         try:
-            from pkuseg import pkuseg
+            from spacy_pkuseg import pkuseg
             self.segmenter = pkuseg()
         except ImportError:
             logger.warning("pkuseg not available - Chinese segmentation will be skipped")
@@ -133,8 +133,6 @@ class ChineseCangjieConverter:
         index = self.cj2word[code].index(normed_glyph)
         index = str(index) if index > 0 else ""
         return code + str(index)
-    
-
     
     def __call__(self, text):
         """Convert Chinese characters in text to Cangjie tokens."""
@@ -160,6 +158,22 @@ class ChineseCangjieConverter:
             else:
                 output.append(t)
         return "".join(output)
+
+
+def add_russian_stress(text: str) -> str:
+    """Russian text normalization: adds stress marks to Russian text."""
+    global _russian_stresser
+    try:
+        if _russian_stresser is None:
+            from russian_text_stresser.text_stresser import RussianTextStresser
+            _russian_stresser = RussianTextStresser()
+        return _russian_stresser.stress_text(text)
+    except ImportError:
+        logger.warning("russian_text_stresser not available - Russian stress labeling skipped")
+        return text
+    except Exception as e:
+        logger.warning(f"Russian stress labeling failed: {e}")
+        return text
 
 
 class MTLTokenizer(PreTrainedTokenizer):
@@ -200,7 +214,7 @@ class MTLTokenizer(PreTrainedTokenizer):
             **kwargs: Additional arguments to pass to the tokenizer
         """
         # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "mtl_tokenizer.json")
+        vocab_file = os.path.join(os.path.dirname(__file__), "grapheme_mtl_merged_expanded_v1.json")
         return cls(vocab_file_path=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):
@@ -210,6 +224,18 @@ class MTLTokenizer(PreTrainedTokenizer):
 
     def get_vocab(self):
         return self.tokenizer.get_vocab()
+    
+    def preprocess_text(self, raw_text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
+        """
+        Text preprocessor that handles lowercase conversion and NFKD normalization.
+        """
+        preprocessed_text = raw_text
+        if lowercase:
+            preprocessed_text = preprocessed_text.lower()
+        if nfkd_normalize:
+            preprocessed_text = normalize("NFKD", preprocessed_text)
+        
+        return preprocessed_text
 
     def _tokenize(self, text: str, **kwargs) -> List[str]:        
         # Parse out language token if it exists
@@ -218,6 +244,8 @@ class MTLTokenizer(PreTrainedTokenizer):
         if text.startswith('<'):
             language_id = text.split('<')[1].split('>')[0]
             text = text.split('>')[1]
+        
+        text = self.preprocess_text(text, language_id)
         
         # Language-specific text processing
         if language_id == 'zh':
@@ -228,6 +256,8 @@ class MTLTokenizer(PreTrainedTokenizer):
             text = add_hebrew_diacritics(text)
         elif language_id == 'ko':
             text = korean_normalize(text)
+        elif language_id == 'ru':
+            text = add_russian_stress(text)
         
         # Prepend language token again
         if language_id:

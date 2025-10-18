@@ -5,7 +5,7 @@ class T3Config:
 
     # HACK: We're hard-coding this into t3.py for now
     # text_tokens_dict_size_english = 704
-    # text_tokens_dict_size_multilingual = 2352
+    # text_tokens_dict_size_multilingual = 2454
 
     start_speech_token = 6561
     stop_speech_token = 6562

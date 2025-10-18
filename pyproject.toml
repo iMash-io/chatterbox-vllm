@@ -13,8 +13,7 @@ keywords = ["llm", "gpt", "cli", "tts", "chatterbox"]
 dependencies = [
     "torch",
     "torchaudio",
-    #"transformers",
-    "transformers<4.54.0",  # https://github.com/vllm-project/vllm-ascend/issues/2046
+    "transformers",
     "tokenizers",
     "scipy",
     "numpy",
@@ -28,7 +27,7 @@ dependencies = [
     "llvmlite>=0.44.0",
     "vllm==0.10.0",
     "gradio",
-    #"pkuseg",  # https://github.com/lancopku/pkuseg-python/issues/180
+    "spacy-pkuseg",
     "pykakasi",
 ]
 
