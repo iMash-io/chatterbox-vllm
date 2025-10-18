@@ -470,13 +470,44 @@ class ChatterboxMultilingualTTS:
                 print(f"[T3] SamplingParams -> temperature={temp_use}, top_p={top_p_use}, "
                       f"max_tokens={min(max_tokens, self.max_model_len)}, stop_token_ids={[stop_offset_id]}")
 
+            # Pre-generation per-prompt token cap (converted to a single batch max_tokens)
+            try:
+                tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
+                tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
+                tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
+                guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
+                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "16"))
+                caps = []
+                for idx, it in enumerate(request_items):
+                    ptxt = it.get("prompt", "")
+                    pclean = re.sub(r"\[[^\]]+\]", "", ptxt)
+                    clen = sum(1 for c in pclean if not c.isspace())
+                    est = int(math.ceil(clen * tpc))
+                    est = max(tmin, min(tmax_env, est))
+                    gcap = int(math.ceil(est * guard_mult))
+                    caps.append(gcap)
+                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                        print(f"[PreCap] idx={idx} char_len={clen} est={est} guard={gcap}")
+                if caps:
+                    pre_cap_tokens = max(1, min(caps) + max(0, pre_margin))
+                else:
+                    pre_cap_tokens = min(max_tokens, self.max_model_len)
+                # Respect caller cap and model cap
+                pre_cap_tokens = min(pre_cap_tokens, min(max_tokens, self.max_model_len))
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[PreCap] chosen_max_tokens={pre_cap_tokens} (margin={pre_margin})")
+            except Exception as _e:
+                pre_cap_tokens = min(max_tokens, self.max_model_len)
+                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                    print(f"[PreCap] error; falling back to max_tokens={pre_cap_tokens}: {_e}")
+
             batch_results = self.t3.generate(
                 request_items,
                 sampling_params=SamplingParams(
                     temperature=temp_use,
 
                     stop_token_ids=[stop_offset_id],
-                    max_tokens=min(max_tokens, self.max_model_len),
+                    max_tokens=pre_cap_tokens,
                     top_p=top_p_use,
                     repetition_penalty=repetition_penalty,
 
