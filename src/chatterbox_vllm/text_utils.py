@@ -1,8 +1,12 @@
 
-def punc_norm(text: str) -> str:
+def punc_norm(text: str, ensure_terminal_punc: bool = True) -> str:
     """
         Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
+        containing chars not seen often in the dataset.
+
+        ensure_terminal_punc:
+            If True, ensure the string ends with a sentence-ending punctuation.
+            If False, do not force terminal punctuation (useful for mid-utterance chunks).
     """
     if len(text) == 0:
         return "You need to add some text for me to talk."
@@ -32,11 +36,12 @@ def punc_norm(text: str) -> str:
     for old_char_sequence, new_char in punc_to_replace:
         text = text.replace(old_char_sequence, new_char)
 
-    # Add full stop if no ending punc
+    # Optionally add full stop if no ending punctuation
     text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
-    if not any(text.endswith(p) for p in sentence_enders):
-        text += "."
+    if ensure_terminal_punc:
+        sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
+        if not any(text.endswith(p) for p in sentence_enders):
+            text += "."
 
     return text
 

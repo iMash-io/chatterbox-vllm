@@ -269,6 +269,13 @@ class ChatterboxTTS:
         top_p=0.8,
         repetition_penalty=2.0,
 
+        # Stage 1 controls for mid-utterance chunking behavior
+        ensure_terminal_punc: bool = True,
+        end_with_stop: bool = True,
+        align_hard_override: Optional[bool] = None,
+        tail_trim_override: Optional[bool] = None,
+        tail_crop_k_override: Optional[int] = None,
+
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
     ) -> list[any]:
@@ -284,6 +291,11 @@ class ChatterboxTTS:
             max_tokens=max_tokens,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
+            ensure_terminal_punc=ensure_terminal_punc,
+            end_with_stop=end_with_stop,
+            align_hard_override=align_hard_override,
+            tail_trim_override=tail_trim_override,
+            tail_crop_k_override=tail_crop_k_override,
             *args, **kwargs
         )
 
@@ -307,6 +319,13 @@ class ChatterboxTTS:
         min_p=0.05,
         repetition_penalty=2.0,
 
+        # Stage 1 controls for mid-utterance chunking behavior
+        ensure_terminal_punc: bool = True,
+        end_with_stop: bool = True,
+        align_hard_override: Optional[bool] = None,
+        tail_trim_override: Optional[bool] = None,
+        tail_crop_k_override: Optional[int] = None,
+
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
     ) -> list[any]:
@@ -324,7 +343,7 @@ class ChatterboxTTS:
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
         # Norm and tokenize text
-        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+        prompts = ["[START]" + punc_norm(p, ensure_terminal_punc=ensure_terminal_punc) + ("[STOP]" if end_with_stop else "") for p in prompts]
 
         # For multilingual, prepend the language token
         if self.variant == "multilingual":
@@ -341,6 +360,11 @@ class ChatterboxTTS:
             tail_trim_safety_ms = int(os.environ.get("CHATTERBOX_TAIL_TRIM_SAFETY_MS", "50"))
             rms_window_ms = int(os.environ.get("CHATTERBOX_RMS_WINDOW_MS", "50"))
             rms_hop_ms = int(os.environ.get("CHATTERBOX_RMS_HOP_MS", "20"))
+            # Stage 1 overrides
+            if tail_crop_k_override is not None:
+                tail_crop_k = int(tail_crop_k_override)
+            if tail_trim_override is not None:
+                tail_trim_on = bool(tail_trim_override)
             dbg = os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on")
             if dbg:
                 print(f"[Tail] cfg: crop_k={tail_crop_k}, trim_on={tail_trim_on}, trim_db={tail_trim_db}, "
@@ -499,6 +523,8 @@ class ChatterboxTTS:
                         n_tokens = int(speech_tokens.numel())
                     expected_samples = int(round(n_tokens * (self.sr / S3_TOKEN_RATE)))
                     align_on = os.environ.get("CHATTERBOX_ALIGN_HARD", "1").lower() in ("1","true","yes","on")
+                    if align_hard_override is not None:
+                        align_on = bool(align_hard_override)
                     align_safety_ms = int(os.environ.get("CHATTERBOX_ALIGN_SAFETY_MS", "0"))
                     align_safety = max(0, int(self.sr * align_safety_ms / 1000))
                     if align_on and wav is not None and wav.numel() > 0:

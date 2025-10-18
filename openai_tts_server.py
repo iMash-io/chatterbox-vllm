@@ -266,6 +266,12 @@ def _synthesize_one(
     exaggeration: float,
     diffusion_steps: int,
     audio_prompt_path: Optional[str],
+    # Stage 1 mid-chunk controls (only forwarded for English engine)
+    ensure_terminal_punc: bool = True,
+    end_with_stop: bool = True,
+    align_hard_override: Optional[bool] = None,
+    tail_trim_override: Optional[bool] = None,
+    tail_crop_k_override: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Synthesize one prompt to a waveform (1, T) tensor.
@@ -289,6 +295,17 @@ def _synthesize_one(
             "ignore_eos": False,
         }
 
+    # Stage-1 overrides only apply to English path (ChatterboxTTS). Multilingual doesn't accept these kwargs.
+    stage1_kwargs = {}
+    if isinstance(tts, ChatterboxTTS):
+        stage1_kwargs = {
+            "ensure_terminal_punc": ensure_terminal_punc,
+            "end_with_stop": end_with_stop,
+            "align_hard_override": align_hard_override,
+            "tail_trim_override": tail_trim_override,
+            "tail_crop_k_override": tail_crop_k_override,
+        }
+
     waves = tts.generate(
         prompts=text,
         audio_prompt_path=audio_prompt_path,
@@ -298,6 +315,7 @@ def _synthesize_one(
         diffusion_steps=diffusion_steps,
         max_tokens=tts.max_model_len,
         **extra_sampling_kwargs,
+        **stage1_kwargs,
     )
     if not waves:
         raise RuntimeError("No audio generated")
@@ -374,13 +392,66 @@ async def _synthesize_streaming_pcm_frames(
     if not chunks:
         return
 
+    # Anti-orphan repair: avoid ending chunks on short function words by borrowing from next chunk
+    import re as _re
+    orphan_words = set(("a an the to of in on at for and or").split())
+    overflow_chars = int(os.environ.get("CHATTERBOX_SPLIT_OVERFLOW_CHARS", "16"))
+    i = 0
+    while i < len(chunks) - 1:
+        cur = chunks[i].rstrip()
+        nxt = chunks[i + 1].lstrip()
+        if not cur or not nxt:
+            i += 1
+            continue
+        # if cur ends with orphan word, try to pull one or two words from next within overflow budget
+        last_word = cur.split()[-1].lower()
+        if last_word in orphan_words:
+            # Pull words from the start of next while budget allows
+            pulled = ""
+            budget = overflow_chars
+            while nxt and budget > 0:
+                parts = nxt.split(maxsplit=1)
+                first = parts[0]
+                rest = parts[1] if len(parts) > 1 else ""
+                extra = (" " if cur and not cur.endswith(" ") else "") + first
+                if len(cur) + len(extra) <= len(cur) + budget:
+                    cur = cur + extra
+                    nxt = rest
+                    budget -= len(extra)
+                    pulled += extra
+                    # stop after pulling up to 2 words to avoid large drift
+                    if pulled.count(" ") >= 2:
+                        break
+                else:
+                    break
+            chunks[i] = cur
+            chunks[i + 1] = nxt.strip()
+            if not chunks[i + 1]:
+                # remove empty next chunk
+                chunks.pop(i + 1)
+                continue  # re-check current i with new next
+        i += 1
+
+    # Overlap-crossfade between chunks to smooth boundaries
+    crossfade_ms = int(os.environ.get("CHATTERBOX_XFADE_MS", "30"))
+    xfade = max(0, int(sr * crossfade_ms / 1000))
+    carry_tail: Optional[torch.Tensor] = None
+
+    strong_punc = {".", "!", "?", ";", ":"}
+
     for idx, chunk in enumerate(chunks):
-        # For the first chunk, optionally reduce steps to cut TTFA. Subsequent chunks full quality.
+        is_last = (idx == len(chunks) - 1)
+
+        # Choose diffusion steps: only use reduced steps for first chunk if it ends on strong punctuation
         steps = diffusion_steps
         if idx == 0 and first_chunk_diff_steps is not None:
-            steps = max(1, int(first_chunk_diff_steps))
+            chs = chunk.strip()
+            if len(chs) > 0 and chs[-1] in strong_punc:
+                steps = max(1, int(first_chunk_diff_steps))
+            else:
+                steps = diffusion_steps
 
-        # Heavy compute dispatched to thread to not block event loop
+        # Synthesize this chunk with mid-chunk trims/alignment disabled; only final chunk keeps defaults
         wav: torch.Tensor = await asyncio.to_thread(
             _synthesize_one,
             chunk,
@@ -389,22 +460,61 @@ async def _synthesize_streaming_pcm_frames(
             exaggeration=exaggeration,
             diffusion_steps=steps,
             audio_prompt_path=audio_prompt_path,
+            ensure_terminal_punc=is_last,  # no terminal punctuation for mid-utterance chunks
+            end_with_stop=is_last,         # do not append [STOP] mid-utterance
+            align_hard_override=(None if is_last else False),
+            tail_trim_override=(None if is_last else False),
+            tail_crop_k_override=(None if is_last else 0),
         )
-
-        # Optional minimal tail fade to avoid end clicks on chunk boundaries (does not alter timbre)
-        fade_ms = 5
-        fade_samples = int(sr * fade_ms / 1000)
-        if wav.numel() > fade_samples and fade_samples > 0:
-            tail = wav[:, -fade_samples:]
-            ramp = torch.linspace(1.0, 0.95, steps=fade_samples, device=tail.device, dtype=tail.dtype).unsqueeze(0)
-            tail_faded = tail * ramp
-            wav = torch.cat([wav[:, :-fade_samples], tail_faded], dim=1)
 
         # Watermark policy (off = no modification)
         wav = _apply_watermark_if_needed(wav, sr, watermark=watermark)
 
-        # To PCM16 and then to 40ms-ish frames
-        pcm_bytes = _float32_to_pcm16_bytes(wav)
+        # Crossfade join and emit PCM frames
+        emit: torch.Tensor
+        if xfade <= 0:
+            # No crossfade requested; emit whole chunk
+            emit = wav
+            carry_tail = None
+        else:
+            if carry_tail is None:
+                if is_last or wav.shape[1] <= xfade:
+                    emit = wav
+                    carry_tail = None
+                else:
+                    # Withhold last xfade samples for blending with next chunk
+                    emit = wav[:, :-xfade]
+                    carry_tail = wav[:, -xfade:].contiguous()
+            else:
+                n = min(xfade, carry_tail.shape[1], wav.shape[1])
+                if n > 0:
+                    tail = carry_tail[:, -n:]
+                    head = wav[:, :n]
+                    ramp = torch.linspace(0.0, 1.0, steps=n, device=wav.device, dtype=wav.dtype).unsqueeze(0)
+                    blended = tail * (1.0 - ramp) + head * ramp
+                    if is_last:
+                        rest = wav[:, n:]
+                        emit = torch.cat([blended, rest], dim=1)
+                        carry_tail = None
+                    else:
+                        if wav.shape[1] > n + xfade:
+                            middle = wav[:, n:-xfade]
+                            emit = torch.cat([blended, middle], dim=1)
+                            carry_tail = wav[:, -xfade:].contiguous()
+                        else:
+                            rest = wav[:, n:]
+                            emit = torch.cat([blended, rest], dim=1)
+                            carry_tail = None
+                else:
+                    # Fallback if very short
+                    if is_last or wav.shape[1] <= xfade:
+                        emit = wav
+                        carry_tail = None
+                    else:
+                        emit = wav[:, :-xfade]
+                        carry_tail = wav[:, -xfade:].contiguous()
+
+        pcm_bytes = _float32_to_pcm16_bytes(emit)
         for frame in _frame_chunk_bytes(pcm_bytes, sr=sr, frame_ms=frame_ms):
             if not frame:
                 continue
