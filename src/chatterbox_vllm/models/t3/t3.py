@@ -765,17 +765,42 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         # TODO: Apply speech positional embeddings here
 
-        hidden_states = self.tfmr(
-            input_ids=None,
-            positions=torch.cat([positions, positions], dim=0),
-            intermediate_tensors=None,
-            inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0)
-        )
-        # print("t3/hidden_states", hidden_states.shape, hidden_states.dtype)
+        # Some attention backends (e.g., FlashAttention 2) can be sensitive to the
+        # sequence-doubling trick (concatenating along the sequence dimension).
+        # Provide a two-pass fallback that runs the transformer once per CFG branch
+        # and then concatenates along the hidden dimension, preserving API expectations.
+        backend = os.environ.get("VLLM_ATTENTION_BACKEND", "").upper()
+        cfg_twopass = os.environ.get("CHATTERBOX_CFG_TWOPASS", "0").lower() in ("1","true","yes","on")
+        use_two_pass = cfg_twopass or backend == "FLASH_ATTENTION_2"
 
-        # Reconcatenate the hidden states into the master tensor
-        hidden_state_1, hidden_state_2 = hidden_states.split([len(cond_embeds), len(uncond_embeds)], dim=0)
-        return torch.cat([hidden_state_1, hidden_state_2], dim=1)
+        if use_two_pass:
+            # Run two passes to avoid sequence-doubling issues
+            hs_cond = self.tfmr(
+                input_ids=None,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=cond_embeds
+            )
+            hs_uncond = self.tfmr(
+                input_ids=None,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=uncond_embeds
+            )
+            # Concatenate along hidden dimension to form [seq_len, 2*dim]
+            hidden_states = torch.cat([hs_cond, hs_uncond], dim=1)
+            return hidden_states
+        else:
+            # Original single-pass trick: concatenate along sequence dimension and split back
+            hidden_states = self.tfmr(
+                input_ids=None,
+                positions=torch.cat([positions, positions], dim=0),
+                intermediate_tensors=None,
+                inputs_embeds=torch.cat([cond_embeds, uncond_embeds], dim=0)
+            )
+            # Reconcatenate the hidden states into the master tensor
+            hidden_state_1, hidden_state_2 = hidden_states.split([len(cond_embeds), len(uncond_embeds)], dim=0)
+            return torch.cat([hidden_state_1, hidden_state_2], dim=1)
 
     def get_language_model(self) -> torch.nn.Module:
         return self.tfmr
