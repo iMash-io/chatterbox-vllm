@@ -501,8 +501,19 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
     ) -> torch.Tensor:
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
-            # Remember to undo the offset we applied to the speech tokens.
-            embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
+            # Safe decode: only offset tokens that are >= SPEECH_TOKEN_OFFSET.
+            # Any token < SPEECH_TOKEN_OFFSET (e.g., stray prefill markers during vLLM profiling)
+            # is mapped to start_speech_token to avoid out-of-range embedding indices.
+            safe_ids = input_ids
+            if not torch.is_floating_point(safe_ids):
+                safe_ids = safe_ids.to(torch.long)
+            safe_ids = torch.where(
+                safe_ids >= SPEECH_TOKEN_OFFSET,
+                safe_ids - SPEECH_TOKEN_OFFSET,
+                torch.full_like(safe_ids, self.t3conf.start_speech_token),
+            )
+            safe_ids = torch.clamp(safe_ids, 0, self.t3conf.speech_tokens_dict_size - 1)
+            embeds = self.speech_emb(safe_ids)
 
             out = torch.cat([embeds, embeds], dim=1)
 
@@ -523,8 +534,17 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
                 if multimodal_embedding is None:
                     # There's no multimodal embeddings, so we're decoding.
-                    # Remember to undo the offset we applied to the speech tokens.
-                    embeds = self.speech_emb(ids - SPEECH_TOKEN_OFFSET)
+                    # Safe decode: only offset tokens that are >= SPEECH_TOKEN_OFFSET.
+                    safe_ids = ids
+                    if not torch.is_floating_point(safe_ids):
+                        safe_ids = safe_ids.to(torch.long)
+                    safe_ids = torch.where(
+                        safe_ids >= SPEECH_TOKEN_OFFSET,
+                        safe_ids - SPEECH_TOKEN_OFFSET,
+                        torch.full_like(safe_ids, self.t3conf.start_speech_token),
+                    )
+                    safe_ids = torch.clamp(safe_ids, 0, self.t3conf.speech_tokens_dict_size - 1)
+                    embeds = self.speech_emb(safe_ids)
                     final_embeds = torch.cat([embeds, embeds], dim=1)
                     # assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                     
