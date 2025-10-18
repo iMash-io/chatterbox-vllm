@@ -107,7 +107,7 @@ class SpeechRequest(BaseModel):
     watermark: Optional[str] = Field(default="off", pattern="^(on|off)$", description="If 'off', no watermarking step is applied")
     primer_silence_ms: Optional[int] = Field(default=0, ge=0, le=200, description="If >0, yield this ms of silence immediately to flush headers")
     first_chunk_diff_steps: Optional[int] = Field(default=10, ge=1, description="Diffusion steps for the first chunk only")
-    first_chunk_chars: Optional[int] = Field(default=60, ge=10, le=200, description="Max chars for the first chunk")
+    first_chunk_chars: Optional[int] = Field(default=30, ge=10, le=200, description="Max chars for the first chunk")
     chunk_chars: Optional[int] = Field(default=120, ge=40, le=400, description="Max chars for subsequent chunks")
     frame_ms: Optional[int] = Field(default=20, ge=10, le=60, description="Frame size for PCM streaming chunks")
 
@@ -425,7 +425,7 @@ async def _synthesize_streaming_pcm_frames(
     watermark: str,
     primer_silence_ms: int = 0,
     first_chunk_diff_steps: Optional[int] = None,
-    first_chunk_chars: int = 60,
+    first_chunk_chars: int = 30,
     chunk_chars: int = 120,
     frame_ms: int = 20,
 ) -> Generator[bytes, None, None]:
@@ -646,7 +646,7 @@ async def create_speech(req: SpeechRequest):
                 watermark=req.watermark or "off",
                 primer_silence_ms=req.primer_silence_ms or 0,
                 first_chunk_diff_steps=(req.first_chunk_diff_steps if req.first_chunk_diff_steps is not None else 10),
-                first_chunk_chars=req.first_chunk_chars or 60,
+                first_chunk_chars=req.first_chunk_chars or 30,
                 chunk_chars=req.chunk_chars or 120,
                 frame_ms=req.frame_ms or 20,
             ),
