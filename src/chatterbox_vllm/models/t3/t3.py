@@ -580,6 +580,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                                 self.tfmr,
                                 text_tokens_slice=text_slice,
                                 eos_idx=self.t3conf.stop_speech_token + SPEECH_TOKEN_OFFSET,
+                                text_embeds=text_emb,
                             )
                             self._align_text_slice = text_slice
                     except Exception:
@@ -647,6 +648,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                                     self.tfmr,
                                     text_tokens_slice=text_slice,
                                     eos_idx=self.t3conf.stop_speech_token + SPEECH_TOKEN_OFFSET,
+                                    text_embeds=text_emb,
                                 )
                                 self._align_text_slice = text_slice
                         except Exception:
@@ -769,7 +771,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # Online alignment-based EOS controller (suppresses early EOS, forces EOS on long tails/repetition)
         if hasattr(self, "alignment_stream_analyzer") and self.alignment_stream_analyzer is not None:
             try:
-                logits = self.alignment_stream_analyzer.step(logits)
+                logits = self.alignment_stream_analyzer.step(logits, hidden_state=cond_hidden_states[-1])
             except Exception:
                 pass
         return logits

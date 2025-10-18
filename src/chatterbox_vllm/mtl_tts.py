@@ -438,7 +438,7 @@ class ChatterboxMultilingualTTS:
             start_time = time.time()
 
             # Tail handling configuration (env-tunable)
-            tail_crop_k = int(os.environ.get("CHATTERBOX_TAIL_CROP_TOKENS", "2"))
+            tail_crop_k = 0
             tail_trim_on = os.environ.get("CHATTERBOX_TAIL_TRIM", "1").lower() in ("1","true","yes","on")
             tail_trim_db = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB", "-42"))
             tail_trim_db_rel = float(os.environ.get("CHATTERBOX_TAIL_TRIM_DB_REL", "-35"))
@@ -471,35 +471,9 @@ class ChatterboxMultilingualTTS:
                       f"max_tokens={min(max_tokens, self.max_model_len)}, stop_token_ids={[stop_offset_id]}")
 
             # Pre-generation per-prompt token cap (converted to a single batch max_tokens)
-            try:
-                tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
-                tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                tmax_env = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
-                guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
-                pre_margin = int(os.environ.get("CHATTERBOX_PRE_GUARD_MARGIN", "16"))
-                caps = []
-                for idx, it in enumerate(request_items):
-                    ptxt = it.get("prompt", "")
-                    pclean = re.sub(r"\[[^\]]+\]", "", ptxt)
-                    clen = sum(1 for c in pclean if not c.isspace())
-                    est = int(math.ceil(clen * tpc))
-                    est = max(tmin, min(tmax_env, est))
-                    gcap = int(math.ceil(est * guard_mult))
-                    caps.append(gcap)
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[PreCap] idx={idx} char_len={clen} est={est} guard={gcap}")
-                if caps:
-                    pre_cap_tokens = max(1, min(caps) + max(0, pre_margin))
-                else:
-                    pre_cap_tokens = min(max_tokens, self.max_model_len)
-                # Respect caller cap and model cap
-                pre_cap_tokens = min(pre_cap_tokens, min(max_tokens, self.max_model_len))
-                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[PreCap] chosen_max_tokens={pre_cap_tokens} (margin={pre_margin})")
-            except Exception as _e:
-                pre_cap_tokens = min(max_tokens, self.max_model_len)
-                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[PreCap] error; falling back to max_tokens={pre_cap_tokens}: {_e}")
+            pre_cap_tokens = min(max_tokens, self.max_model_len)
+            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
+                print(f"[PreCap] chosen_max_tokens={pre_cap_tokens} (no char-based cap)")
 
             batch_results = self.t3.generate(
                 request_items,
@@ -547,14 +521,9 @@ class ChatterboxMultilingualTTS:
 
                     if stop_offset_id in tok_ids:
                         stop_idx = tok_ids.index(stop_offset_id)
-                        # Optional token-tail crop: drop K tokens immediately before EOS to avoid artifacts
-                        new_end = max(0, stop_idx - max(0, int(tail_crop_k)))
+                        tok_ids = tok_ids[:stop_idx]
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            removed = len(tok_ids) - new_end
-                            tail_preview = tok_ids[max(0, new_end-10):new_end]
-                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}, "
-                                  f"crop_k={tail_crop_k}, new_end={new_end}, removed={removed}, tail_before_crop={tail_preview}")
-                        tok_ids = tok_ids[:new_end]
+                            print(f"[T3][eos] truncating at stop_offset_id={stop_offset_id} index={stop_idx}")
                     else:
                         # If no EOS, note whether we hit max_tokens
                         if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
@@ -565,29 +534,6 @@ class ChatterboxMultilingualTTS:
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
 
-                    # Dynamic overrun guard based on normalized prompt length (language-agnostic)
-                    try:
-                        prompt_str = request_items[i].get("prompt", "")
-                        # Strip [lang], [START], [STOP], etc.
-                        prompt_clean = re.sub(r"\[[^\]]+\]", "", prompt_str)
-                        # Remove whitespace for character count
-                        char_len = sum(1 for c in prompt_clean if not c.isspace())
-                        tpc = float(os.environ.get("CHATTERBOX_TOKENS_PER_CHAR", "2.2"))
-                        tmin = int(os.environ.get("CHATTERBOX_TOKENS_MIN", "64"))
-                        tmax = int(os.environ.get("CHATTERBOX_TOKENS_MAX", "1200"))
-                        guard_mult = float(os.environ.get("CHATTERBOX_TOKENS_GUARD_MULT", "1.6"))
-                        est_tokens = int(math.ceil(char_len * tpc))
-                        est_tokens = max(tmin, min(tmax, est_tokens))
-                        guard_cap = int(math.ceil(est_tokens * guard_mult))
-                        n_tokens_cur = int(speech_tokens.shape[0]) if speech_tokens.ndim == 1 else int(speech_tokens.shape[1])
-                        if n_tokens_cur > guard_cap:
-                            if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                                print(f"[Guard] char_len={char_len} est={est_tokens} guard={guard_cap} n_tokens={n_tokens_cur} -> cap to {guard_cap}")
-                            # speech_tokens is 1D by construction after drop; keep slicing safe
-                            speech_tokens = speech_tokens[:guard_cap]
-                    except Exception as _e:
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[Guard] skipped due to error: {_e}")
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,

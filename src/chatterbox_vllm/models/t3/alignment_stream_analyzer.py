@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class AlignmentStreamAnalyzer:
         text_tokens_slice: Tuple[int, int],
         alignment_layer_idx: int = 9,
         eos_idx: int = 0,
+        text_embeds: Optional[torch.Tensor] = None,
     ):
         """
         tfmr: vLLM LlamaModel instance (self.tfmr from T3VllmModel)
@@ -66,6 +68,19 @@ class AlignmentStreamAnalyzer:
 
         # Track generated tokens for repetition detection
         self.generated_tokens: list[int] = []
+
+        # Optional fallback alignment via cosine similarity to prefill text embeddings
+        self.text_embeds_norm: Optional[torch.Tensor] = None
+        if text_embeds is not None:
+            try:
+                # Normalize text embeddings rows for cosine similarity
+                ten = text_embeds.detach().float()
+                self.text_embeds_norm = F.normalize(ten, dim=-1).cpu()
+            except Exception:
+                self.text_embeds_norm = None
+
+        # Fallback tail counter when using similarity-based alignment
+        self.tail_frames: int = 0
 
         # Forward hooks to capture attentions for a few heads
         self.last_aligned_attns = []
@@ -102,7 +117,7 @@ class AlignmentStreamAnalyzer:
         except Exception as _e:
             logger.warning(f"Failed to register attention hook for alignment: {str(_e)}")
 
-    def step(self, logits: torch.Tensor, next_token: Optional[int] = None) -> torch.Tensor:
+    def step(self, logits: torch.Tensor, hidden_state: Optional[torch.Tensor] = None, next_token: Optional[int] = None) -> torch.Tensor:
         """
         Potentially modifies logits in-place:
         - Suppress EOS during early alignment (prevents early cut-offs)
@@ -119,9 +134,38 @@ class AlignmentStreamAnalyzer:
             # Gather averaged attention for the selected heads
             aligned_avail = [a for a in self.last_aligned_attns if a is not None]
             if not aligned_avail:
-                # No attentions yet; apply a minimal early-EOS safety for the very first frames
-                if self.curr_frame_pos < 2:
-                    logits[..., self.eos_idx] = -2**15
+                # Fallback: estimate alignment via cosine similarity to prefill text embeddings if available
+                if (self.text_embeds_norm is not None) and (hidden_state is not None):
+                    try:
+                        h = hidden_state
+                        if isinstance(h, torch.Tensor) and h.ndim > 1:
+                            h = h[-1]
+                        h = F.normalize(h.detach().float(), dim=-1).cpu()
+                        sims = torch.matmul(self.text_embeds_norm, h.unsqueeze(-1)).squeeze(-1)  # (S,)
+                        cur_text_posn = int(torch.argmax(sims).item())
+                        S = int(self.text_embeds_norm.shape[0])
+                        # Update position/complete tracking
+                        discontinuity = not (-4 < cur_text_posn - self.text_position < 7)
+                        if not discontinuity:
+                            self.text_position = cur_text_posn
+                        self.complete = self.complete or (self.text_position >= S - 3 if S > 0 else False)
+                        if self.complete:
+                            self.tail_frames += 1
+                        # Early EOS suppression while far from end
+                        if (cur_text_posn < (S - 3)) and (S > 5):
+                            logits[..., self.eos_idx] = -2**15
+                        # Simple long-tail cutoff if we've been complete for enough frames
+                        if self.complete and self.tail_frames >= 12:
+                            logits[..., :] = -(2**15)
+                            logits[..., self.eos_idx] = 2**15
+                    except Exception:
+                        # Minimal early-EOS safety for the very first frames
+                        if self.curr_frame_pos < 2:
+                            logits[..., self.eos_idx] = -2**15
+                else:
+                    # Minimal early-EOS safety for the very first frames
+                    if self.curr_frame_pos < 2:
+                        logits[..., self.eos_idx] = -2**15
                 self.curr_frame_pos += 1
                 return logits
 
