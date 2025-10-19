@@ -74,7 +74,6 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from chatterbox_vllm.tts import ChatterboxTTS
-from chatterbox_vllm.mtl_tts import ChatterboxMultilingualTTS
 
 
 APP = FastAPI(title="OpenAI-compatible TTS for chatterbox-vllm")
@@ -404,7 +403,7 @@ def _synthesize_one(
     tts = _ensure_engine()
 
     # Auto-detect language if caller didn't provide one (important for Hebrew and others)
-    if isinstance(tts, ChatterboxMultilingualTTS) and (not language_id or not str(language_id).strip()):
+    if getattr(tts, "variant", "english") == "multilingual" and (not language_id or not str(language_id).strip()):
         autodetect = _detect_language(text)
         if autodetect:
             print(f"[Server] Auto-detected language_id='{autodetect}' from input text")
@@ -413,7 +412,7 @@ def _synthesize_one(
     # For multilingual vLLM path, ensure special tokens aren't altered by tokenizer settings.
     # Do NOT ignore EOS: allow decoder to stop on speech stop token.
     extra_sampling_kwargs = {}
-    if isinstance(tts, ChatterboxMultilingualTTS):
+    if getattr(tts, "variant", "english") == "multilingual":
         extra_sampling_kwargs = {
             "spaces_between_special_tokens": False,
             "skip_special_tokens": False,
@@ -548,24 +547,16 @@ async def _startup() -> None:
     # Load the selected engine (single instance)
     try:
         if _local_ckpt:
-            if _variant == "multilingual":
-                _tts_engine = ChatterboxMultilingualTTS.from_local(
-                    ckpt_dir=_local_ckpt,
-                    target_device=_device,
-                    s3gen_use_fp16=_s3gen_use_fp16,
-                    compile=_enable_compile,
-                )
-            else:
-                _tts_engine = ChatterboxTTS.from_local(
-                    ckpt_dir=_local_ckpt,
-                    target_device=_device,
-                    variant="english",
-                    s3gen_use_fp16=_s3gen_use_fp16,
-                    compile=_enable_compile,
-                )
+            _tts_engine = ChatterboxTTS.from_local(
+                ckpt_dir=_local_ckpt,
+                target_device=_device,
+                s3gen_use_fp16=_s3gen_use_fp16,
+                compile=_enable_compile,
+                variant=_variant,
+            )
         else:
             if _variant == "multilingual":
-                _tts_engine = ChatterboxMultilingualTTS.from_pretrained(
+                _tts_engine = ChatterboxTTS.from_pretrained_multilingual(
                     target_device=_device,
                     s3gen_use_fp16=_s3gen_use_fp16,
                     compile=_enable_compile,
@@ -585,7 +576,7 @@ async def _startup() -> None:
         _ = _tts_engine.get_audio_conditionals(None)
 
         warm_extra_sampling_kwargs = {}
-        if isinstance(_tts_engine, ChatterboxMultilingualTTS):
+        if getattr(_tts_engine, "variant", "english") == "multilingual":
             warm_extra_sampling_kwargs = {
                 "spaces_between_special_tokens": False,
                 "skip_special_tokens": False,

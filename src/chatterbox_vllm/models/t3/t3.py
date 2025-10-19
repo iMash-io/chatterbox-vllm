@@ -46,7 +46,7 @@ CONDITIONING_SIZE = 34 # 1 for speaker_emb, 0 for clap_emb, 32 for cond_prompt_s
 # normal speech tokens. This way, any token < SPEECH_TOKEN_OFFSET is a prefill token, and any token
 # >= SPEECH_TOKEN_OFFSET is a decode token. This will only affect the logits and the encoding logic.
 # No effect on the hidden states or the actual Llama model itself.
-SPEECH_TOKEN_OFFSET = 1000
+SPEECH_TOKEN_OFFSET = 2500
 
 
 class T3ProcessingInfo(BaseProcessingInfo):
@@ -134,24 +134,7 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         tokenizer = self.info.get_tokenizer()
-        # Ensure language tag is embedded in the prompt string (HF tokenizer __call__ won't forward custom kwargs)
-        _tk = tok_kwargs or {}
-        _lang = _tk.get("language_id", None)
-        if isinstance(_lang, str) and _lang:
-            tag = f"[{_lang.lower()}]"
-            if not prompt.startswith(tag):
-                prompt = tag + prompt
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            print(f"[T3Processor][_call_hf_processor] lang={_lang} prompt='{prompt[:120]}'")
-        processed_outputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            try:
-                _ids = processed_outputs.get("input_ids", None)
-                if _ids is not None:
-                    _ids0 = _ids[0].tolist() if hasattr(_ids, "tolist") else []
-                    print(f"[T3Processor][_call_hf_processor] input_ids_len={len(_ids0)} head={_ids0[:16]}")
-            except Exception as _e:
-                print(f"[T3Processor][_call_hf_processor] debug error: {_e}")
+        processed_outputs = tokenizer(prompt, return_tensors="pt")
         processed_outputs['conditionals'] = mm_data.get('conditionals', None)
         if processed_outputs['conditionals'] is not None:
             print("processed_outputs", processed_outputs['conditionals'].shape)
@@ -196,29 +179,6 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             # Skip prompt caching calculation for now
             return_mm_hashes=False,
         )
-
-        # Debug: show prompt_ids before/after sanitize
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            try:
-                _ids_dbg = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else (prompt_ids if isinstance(prompt_ids, list) else [])
-                print(f"[T3Processor][apply] prompt_ids.len={len(_ids_dbg)} head={_ids_dbg[:16]}")
-            except Exception as _e:
-                print(f"[T3Processor][apply] prompt_ids debug error: {_e}")
-
-        # Sanitize: optionally remove LLaMA EOS tokens (id=2) if explicitly enabled.
-        # For custom tokenizers (EnTokenizer/MTLTokenizer), id==2 can be a valid token; stripping it corrupts text.
-        try:
-            strip_eos = os.environ.get("CHATTERBOX_STRIP_LLM_EOS", "0").lower() in ("1","true","yes","on")
-            if isinstance(prompt_ids, torch.Tensor):
-                prompt_ids = prompt_ids.tolist()
-            if strip_eos and isinstance(prompt_ids, list):
-                before_len = len(prompt_ids)
-                prompt_ids = [pid for pid in prompt_ids if pid != 2]
-                after_len = len(prompt_ids)
-                if before_len != after_len:
-                    print(f"t3/apply: stripped {before_len - after_len} EOS tokens from prompt_ids")
-        except Exception as _e:
-            print(f"t3/apply: sanitize prompt_ids failed: {_e}")
 
         # We are going to apply custom logic to squish the embeddings in the right format.
         # The final embedding will look like <| cond | text | speech |>
@@ -271,13 +231,6 @@ class T3MultiModalProcessor(BaseMultiModalProcessor[T3ProcessingInfo]):
             )
         ])
 
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            try:
-                print(f"[T3Processor][apply] final_prompt_ids.len={len(final_prompt_ids)} head={final_prompt_ids[:16]}")
-                print(f"[T3Processor][apply] new_conditionals.shape={new_conditionals.shape}")
-            except Exception as _e:
-                print(f"[T3Processor][apply] final ids debug error: {_e}")
-
         return MultiModalInputs(
             type="multimodal",
             prompt=prompt, # It's unclear if this is actually used for anything. Don't change it for now.
@@ -314,13 +267,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # Initialize LLaMA backbone
         self.tfmr = LlamaModel(vllm_config=vllm_config, prefix=prefix + ".tfmr")
 
-        # Initialize custom components
-        is_multilingual = getattr(self.cfg.hf_config, 'is_multilingual', False)
+        text_tokens_dict_size = 704 if self.cfg.tokenizer == "EnTokenizer" else 2454
 
-        self.t3conf = T3Config.multilingual() if is_multilingual else T3Config()
+        # Initialize custom components
+        self.t3conf = T3Config()
         self.dim = self.t3conf.n_channels
         self.cond_enc = T3CondEnc(self.t3conf)
-        self.text_emb = nn.Embedding(self.t3conf.text_tokens_dict_size, self.dim)
+        self.text_emb = nn.Embedding(text_tokens_dict_size, self.dim)
         self.speech_emb = nn.Embedding(self.t3conf.speech_tokens_dict_size, self.dim)
 
         # custom position embedding
@@ -331,7 +284,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.speech_pos_emb = LearnedPositionEmbeddings(max_mel_seq_len, self.dim)
 
         # logit projection
-        # self.text_head = nn.Linear(self.dim, self.t3conf.text_tokens_dict_size, bias=False)
+        # self.text_head = nn.Linear(self.dim, text_tokens_dict_size, bias=False)
         self.speech_head = ParallelLMHead(
             num_embeddings=self.t3conf.speech_tokens_dict_size,
             embedding_dim=self.dim,
@@ -393,13 +346,20 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         vLLM combines the prefill and decode into a single input tensor. We need to split them back
         out, and match the decode parts with the corresponding multimodal embeddings.
 
-        IMPORTANT: Do NOT use numeric thresholds to separate prefill vs decode since multilingual
-        text token IDs can exceed SPEECH_TOKEN_OFFSET. Instead, use the explicit prefill markers:
-        - PREFILL_COND_START_TOKEN (695) marks the beginning (can appear mid-chunk)
-        - PREFILL_END_TOKEN (697) marks the end of prefill block
-        Everything before the first PREFILL_END_TOKEN in a request belongs to prefill; decode starts
-        after PREFILL_END_TOKEN. vLLM may split the block across batches.
-        Returns list of (ids, mme_or_None) segments. mme is provided for prefill segments.
+        Because of the SPEECH_TOKEN_OFFSET, the prefill tokens will always be <SPEECH_TOKEN_OFFSET and
+        and the decode tokens will always be >= SPEECH_TOKEN_OFFSET.
+
+        Furthermore, the prefill always starts with PREFILL_COND_START_TOKEN, and
+        ends with PREFILL_END_TOKEN. However, vLLM can split the prefill across multiple batches,
+        so we won't always have the complete prefill block in a single batch - we might only have the
+        beginning or the end of a block.
+
+        We can see back-to-back prefill blocks, so we can't just look for continuous sequences of
+        prefill tokens. This nuance is not relevant for decode tokens as their position does not matter.
+
+        Returns a list of tuples, where the first element is the input IDs for the block,
+        and the second element is the associated multimodal embedding if the block is a decode part.
+        If the block is a prefill part, the second element is None.
         """
 
         if len(input_ids) == 0:
@@ -412,78 +372,44 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         # with open("/ram/multimodal_embeddings.txt", "w") as f:
         #     f.write(str([i.tolist() for i in (multimodal_embeddings or [])]))
 
-        # State machine driven solely by explicit prefill markers.
-        in_prefill_block: Optional[bool] = None  # None means undecided yet (assume prefill until we see end)
-        output: list[tuple[torch.Tensor, Optional[MultiModalEmbeddings]]] = []
-        buffer: list[int] = []
+        in_prefill_block = input_ids[0] < SPEECH_TOKEN_OFFSET
 
-        def flush_segment(is_prefill: bool):
-            nonlocal buffer, remaining_multimodal_embeddings, output
-            if not buffer:
-                return
-            seg = torch.tensor(buffer).to(input_ids.device)
-            if is_prefill:
-                take = len(buffer)
-                # Safe-guard: if vLLM gave fewer mme rows than needed, clamp
-                take = min(take, len(remaining_multimodal_embeddings))
-                mme, remaining_multimodal_embeddings = remaining_multimodal_embeddings.split(
-                    [take, max(0, len(remaining_multimodal_embeddings) - take)], dim=0
-                )
-                output.append((seg, mme))
-            else:
-                output.append((seg, None))
-            buffer = []
+        output = []
 
+        # Keep a buffer of current tokens
+        buffer = []
+
+        # Iterate through the element and if we hit block header, set the block state to true
+        # Else if we hit the block footer, set block state to false
+        # Every time we swtich between block states, add the current buffer to the output if not empty
+        # If we we switch out of block mode, add the multimodal embedding
         for input_id in input_ids:
-            # Optionally skip LLaMA EOS (id=2) only if explicitly enabled via env.
-            # Default is to keep id=2 since our custom tokenizer may legitimately produce it.
-            try:
-                if os.environ.get("CHATTERBOX_STRIP_LLM_EOS", "0").lower() in ("1","true","yes","on"):
-                    if int(input_id) == 2:
-                        continue
-            except Exception:
-                pass
+            # Check if we've swapped between prefill and decode blocks, or if we've just hit the start of a new prefill block
+            if (in_prefill_block != (input_id < SPEECH_TOKEN_OFFSET)) or (input_id == PREFILL_COND_START_TOKEN):
+                if buffer:
+                    if in_prefill_block:
+                        # assert len(remaining_multimodal_embeddings) >= len(buffer), "Not enough remaining multimodal embeddings"
+                        mme, remaining_multimodal_embeddings = remaining_multimodal_embeddings\
+                            .split([len(buffer), len(remaining_multimodal_embeddings) - len(buffer)], dim=0)
+                        output.append((torch.tensor(buffer).to(input_ids.device), mme))
+                    else:
+                        output.append((torch.tensor(buffer).to(input_ids.device), None))
 
-            tok = int(input_id)
+                buffer = []
+                in_prefill_block = (input_id < SPEECH_TOKEN_OFFSET)
 
-            if tok == PREFILL_COND_START_TOKEN:
-                # Starting (or re-starting) a prefill block
-                if in_prefill_block is not None:
-                    # Flush previous segment before switching
-                    flush_segment(in_prefill_block)
-                in_prefill_block = True
-                buffer.append(tok)
-                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[T3Processor][split] hit START (695), entering prefill; buf_len=1")
-                continue
+            # Add new token to buffer
+            buffer.append(input_id)
 
-            if tok == PREFILL_END_TOKEN:
-                # End of prefill block: include token in prefill segment and flush
-                if in_prefill_block is None:
-                    in_prefill_block = True  # treat prior tokens as prefill if undecided
-                buffer.append(tok)
-                flush_segment(True)
-                in_prefill_block = False
-                if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                    print(f"[T3Processor][split] hit END (697), leaving prefill")
-                continue
-
-            # Regular token
-            if in_prefill_block is None:
-                # Assume prefill until we see first END marker
-                in_prefill_block = True
-            buffer.append(tok)
-
-        # Flush remaining tokens
+        # Add any elements left in the buffer
         if buffer:
-            flush_segment(bool(in_prefill_block))
-
-        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-            try:
-                print(f"[T3Processor][split] segments={len(output)} " +
-                      (f"first_len={len(output[0][0])} first_prefill={output[0][1] is not None}" if output else ""))
-            except Exception as _e:
-                print(f"[T3Processor][split] debug error: {_e}")
+            if in_prefill_block:
+                # assert len(remaining_multimodal_embeddings) >= len(buffer), "Not enough remaining multimodal embeddings"
+                mme, remaining_multimodal_embeddings = remaining_multimodal_embeddings\
+                    .split([len(buffer), len(remaining_multimodal_embeddings) - len(buffer)], dim=0)
+                output.append((torch.tensor(buffer).to(input_ids.device), mme))
+            else:
+                output.append((torch.tensor(buffer).to(input_ids.device), None))
 
         # if len(remaining_multimodal_embeddings) > 0:
         #     print("t3/split_prefill_decode/input_ids", input_ids)
@@ -503,6 +429,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             # There's no multimodal embeddings, so we're decoding.
             # Remember to undo the offset we applied to the speech tokens.
+
+            # if torch.min(input_ids) < SPEECH_TOKEN_OFFSET:
+            #     print("input_ids", input_ids)
+            #     print("torch.min(input_ids)", torch.min(input_ids))
+            #     print("SPEECH_TOKEN_OFFSET", SPEECH_TOKEN_OFFSET)
+            #     raise ValueError("input_ids is less than SPEECH_TOKEN_OFFSET")
+
             embeds = self.speech_emb(input_ids - SPEECH_TOKEN_OFFSET)
 
             out = torch.cat([embeds, embeds], dim=1)
@@ -547,8 +480,6 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
                 if ids[0] == PREFILL_COND_START_TOKEN and ids[-1] == PREFILL_END_TOKEN:
                     # We have the full prefill block.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[T3Processor][embeds] full prefill ids_len={len(ids)}")
 
                     # The first 34 tokens are the cond portion. The remainder, except for the last token are the text
                     # portion. The last token is a placeholder for the start of speech token.
@@ -569,8 +500,6 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     out.append(final_embeds)
                 elif ids[0] == PREFILL_COND_START_TOKEN:
                     # We have the start of the prefill block.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[T3Processor][embeds] start prefill ids_len={len(ids)}")
                     # The only thing we an assume here is that we don't have the end token, so we can skip the start of speech token.
                     # print("t3/get_input_embeddings/start of prefill block")
 
@@ -592,8 +521,6 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                     out.append(final_embeds)
                 elif ids[-1] == PREFILL_END_TOKEN:
                     # We have the end of the prefill block.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[T3Processor][embeds] end prefill ids_len={len(ids)}")
                     # The only thing we an assume here is that we have the start of speech token,
                     # and that our conditioning embeddings will at minimum be truncated. We can't
                     # assume anything about the text portion.
@@ -643,75 +570,12 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                         assert len(final_embeds) == len(ids), "Number of output elements does not match number of input elements"
                         out.append(final_embeds)
 
-                elif len(ids) == 1 and ids[0] == PREFILL_COND_END_TOKEN:
-                    # Edge case: a batch split produced a chunk with only the end-of-conditioning token (696).
-                    # For conditioning-only tokens, use the provided multimodal embedding slice directly
-                    # for both cond and uncond halves.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[T3Processor][embeds] cond-only tail ids_len=1 (token=696)")
-                    final_embeds = torch.cat([multimodal_embedding, multimodal_embedding], dim=1)
-                    out.append(final_embeds)
-                elif len(ids) == 1 and ids[0] == PREFILL_COND_START_TOKEN:
-                    # Edge case: a batch split produced a chunk with only the start-of-conditioning token (695).
-                    # Treat similarly: use provided multimodal embedding slice for both halves.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print(f"[T3Processor][embeds] cond-only head ids_len=1 (token=695)")
-                    final_embeds = torch.cat([multimodal_embedding, multimodal_embedding], dim=1)
-                    out.append(final_embeds)
-                elif (ids[0] != PREFILL_COND_START_TOKEN) and (ids[-1] != PREFILL_END_TOKEN):
-                    # Middle prefill text slice (neither starts with 695 nor ends with 697).
-                    # Use positional encoding hints injected into multimodal_embedding (triangular matrix rows)
-                    # to recover absolute positions for this chunk.
-                    try:
-                        text_ids = ids
-                        # text_pos is count of ones per row minus 1 (as encoded in apply/new_conditionals)
-                        text_pos = torch.sum(multimodal_embedding[0:len(text_ids)], dim=1) - 1
-                        text_emb = self.text_emb(text_ids) + self.precomputed_text_pos_emb[text_pos.tolist()]
-                        # CFG: cond path gets text_emb, uncond path gets zeros of same shape
-                        cond_embeds = text_emb
-                        uncond_embeds = torch.zeros_like(text_emb)
-                        final_embeds = torch.cat([cond_embeds, uncond_embeds], dim=1)
-                        out.append(final_embeds)
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[T3Processor][embeds] middle prefill ids_len={len(ids)}")
-                    except Exception as _e:
-                        if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                            print(f"[T3Processor][embeds] middle prefill failed, filling zeros: {_e}")
-                        zeros = torch.zeros(
-                            (len(ids), 2 * self.dim),
-                            device=ids.device,
-                            dtype=self.text_emb.weight.dtype,
-                        )
-                        out.append(zeros)
                 else:
-                    # Unknown edge-case prefill chunk (e.g., scheduler split around a boundary).
-                    # Fall back to zero embeddings for this segment to keep alignment and avoid engine crash.
-                    if os.environ.get("CHATTERBOX_DEBUG", "0").lower() in ("1","true","yes","on"):
-                        print("t3/get_input_embeddings/WARN: unknown prefill block; filling zeros for alignment")
-                        print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
-                        print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
-                    zeros = torch.zeros(
-                        (len(ids), 2 * self.dim),
-                        device=ids.device,
-                        dtype=self.text_emb.weight.dtype,
-                    )
-                    out.append(zeros)
-                    continue
-
-            # Fallback: if no valid prefill/decode blocks were produced (e.g., stray EOS-only chunk),
-            # return a minimal zero embedding to keep alignment with input_ids length.
-            if len(out) == 0:
-                try:
-                    zeros = torch.zeros(
-                        (len(input_ids), 2 * self.dim),
-                        device=input_ids.device,
-                        dtype=self.text_emb.weight.dtype,
-                    )
-                    # print("t3/get_input_embeddings/fallback: returning zero embeds for stray block")
-                    return zeros
-                except Exception as _e:
-                    print(f"t3/get_input_embeddings/fallback failed: {_e}")
-                    raise
+                    # Something else - we don't know what to do with this.
+                    print("t3/get_input_embeddings/ERROR: prefill block contains neither start nor end. Please report this issue.")
+                    print("t3/get_input_embeddings/ids", ids.shape, ids.dtype, ids)
+                    print("t3/get_input_embeddings/multimodal_embedding", multimodal_embedding.shape if multimodal_embedding is not None else None)
+                    raise ValueError(f"Unknown prefill block: {ids}")
 
             output = torch.cat(out, dim=0)
 
@@ -723,19 +587,28 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        # print("t3/compute_logits/hidden_states", hidden_states.shape, hidden_states.dtype)
+        # print("t3/compute_logits/sampling_metadata", sampling_metadata)
+
         # Split the hidden state vector into the three parts
         cond_hidden_states, uncond_hidden_states = hidden_states.split([self.dim, self.dim], dim=1)
-    
+        # print("t3/compute_logits/normal_hidden_states", normal_hidden_states.shape, normal_hidden_states.dtype)
+        # print("t3/compute_logits/cfg_hidden_states", cfg_hidden_states.shape, cfg_hidden_states.dtype)
+
         cond_logits = self.logits_processor(self.speech_head, cond_hidden_states, sampling_metadata)
         uncond_logits = self.logits_processor(self.speech_head, uncond_hidden_states, sampling_metadata)
-    
+
         logits = cond_logits + self.cfg_scale * (cond_logits - uncond_logits)
-    
+
+        # print("t3/compute_logits/logit with the highest probability (cond, uncond, post-cfg):", cond_logits.argmax(), uncond_logits.argmax(), logits.argmax())
+
         # HACK: Offset the logits so the resulting speech token is +SPEECH_TOKEN_OFFSET from the normal speech tokens.
-        # Use -inf instead of zeros to ensure these padding tokens can never be selected
-        padding = torch.full((logits.shape[0], SPEECH_TOKEN_OFFSET), float('-inf'), 
-                             dtype=logits.dtype, device=logits.device)
-        logits = torch.cat([padding, logits], dim=1)
+        #       We'll do this by adding SPEECH_TOKEN_OFFSET fake dimensions to the left of the logits.
+        #       This is a hack to help us unbatch batched inputs.
+        logits = torch.cat([
+            torch.zeros(logits.shape[0], SPEECH_TOKEN_OFFSET).to(logits.device).fill_(float('-inf')),
+            logits,
+        ], dim=1)
         return logits
 
 
@@ -747,6 +620,7 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         inputs_embeds: Optional[torch.Tensor] = None,  # The actual inputs to the model
         **kwargs: object,
     ) -> torch.Tensor:
+        # print("t3 ###")
         # print("t3/inputs_embeds", inputs_embeds.shape, inputs_embeds.dtype)
         # print("t3/positions", positions.shape, positions.dtype)
 
@@ -760,8 +634,8 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         # Split the inputs_embeds into the three parts
         cond_embeds, uncond_embeds = inputs_embeds.split([self.dim, self.dim], dim=1)
-        # print("t3/embeds", embeds.shape, embeds.dtype)
-        # print("t3/cfg_embeds", cfg_embeds.shape, cfg_embeds.dtype)
+        # print("t3/cond_embeds", cond_embeds.shape, cond_embeds.dtype)
+        # print("t3/uncond_embeds", uncond_embeds.shape, uncond_embeds.dtype)
 
         # TODO: Apply speech positional embeddings here
 
