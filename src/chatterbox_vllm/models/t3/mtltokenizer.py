@@ -228,6 +228,8 @@ class MTLTokenizer(PreTrainedTokenizer):
     def preprocess_text(self, raw_text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
         """
         Text preprocessor that handles lowercase conversion and NFKD normalization.
+        Preserves the canonical casing of special tokens like [START] and [STOP]
+        so they are not spoken literally by the model.
         """
         preprocessed_text = raw_text
         if lowercase:
@@ -235,6 +237,16 @@ class MTLTokenizer(PreTrainedTokenizer):
         if nfkd_normalize:
             preprocessed_text = normalize("NFKD", preprocessed_text)
         
+        # Restore canonical casing for special tokens after lowercasing/normalization.
+        # This ensures [START]/[STOP]/[SPACE]/[UNK]/etc. remain recognized by the vocab.
+        try:
+            for tok in SPECIAL_TOKENS:
+                lt = tok.lower()
+                preprocessed_text = preprocessed_text.replace(lt, tok)
+        except Exception:
+            # Non-fatal: if anything goes wrong, fall back to the lowercased text.
+            pass
+
         return preprocessed_text
 
     def _tokenize(self, text: str, **kwargs) -> List[str]:        
